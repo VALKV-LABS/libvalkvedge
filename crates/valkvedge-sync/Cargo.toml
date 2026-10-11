@@ -1,8 +1,16 @@
 [package]
 name = "valkvedge-sync"
+description = "Replication for valkvedge: pulling a database's log and the writer role that produces it"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
-fjall.workspace = true
-object_store.workspace = true
+valkvedge-log.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
