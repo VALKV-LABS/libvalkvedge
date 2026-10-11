@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::task::JoinHandle;
-use tokio::time::Instant;
+use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 /// Timing parameters for heartbeats and leases.
 #[derive(Debug, Clone)]
@@ -91,11 +91,11 @@ pub struct Node {
 }
 
 #[derive(Debug)]
-struct TaskGuard(JoinHandle<()>);
+struct TaskGuard(Arc<AtomicBool>);
 
 impl Drop for TaskGuard {
     fn drop(&mut self) {
-        self.0.abort();
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
@@ -135,17 +135,30 @@ impl Node {
         });
         inner.beat().await?;
         let renew = inner.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(renew.config.heartbeat_interval).await;
-                if let Err(e) = renew.beat().await {
+        // The heartbeat runs on its own thread and runtime. Liveness must not
+        // depend on the application's runtime being free: a blocked or busy
+        // executor would otherwise look like a dead node.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| Error::local(format!("heartbeat runtime: {e}")))?;
+        std::thread::Builder::new()
+            .name(format!("valkvedge-heartbeat-{}", renew.node_id))
+            .spawn(move || loop {
+                std::thread::sleep(renew.config.heartbeat_interval);
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                if let Err(e) = runtime.block_on(renew.beat()) {
                     tracing::warn!(node = %renew.node_id, error = %e, "heartbeat renewal failed");
                 }
-            }
-        });
+            })
+            .map_err(|e| Error::local(format!("heartbeat thread: {e}")))?;
         Ok(Node {
             inner,
-            task: Arc::new(TaskGuard(task)),
+            task: Arc::new(TaskGuard(stop)),
         })
     }
 
@@ -183,7 +196,7 @@ impl Node {
 
     /// Stops renewing the heartbeat. Used by tests to simulate a dead node.
     pub fn stop_heartbeat(&self) {
-        self.task.0.abort();
+        self.task.0.store(true, Ordering::SeqCst);
     }
 }
 
