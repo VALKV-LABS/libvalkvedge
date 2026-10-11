@@ -1,0 +1,4 @@
+[package]
+name = "valkvedge-cli"
+version.workspace = true
+edition.workspace = true

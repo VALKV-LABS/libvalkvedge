@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/valkvedge-log",
+    "crates/valkvedge-sync",
+    "crates/valkvedge",
+    "crates/valkvedge-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/VALKV-LABS/libvalkvedge"
+
+[workspace.dependencies]
+valkvedge-log = { path = "crates/valkvedge-log", version = "0.1.0" }
+valkvedge-sync = { path = "crates/valkvedge-sync", version = "0.1.0" }
+valkvedge = { path = "crates/valkvedge", version = "0.1.0" }
+
+async-trait = "0.1"
+bytes = "1"
+chacha20poly1305 = "0.10"
+clap = { version = "4", features = ["derive"] }
+crc32fast = "1"
+fjall = "3"
+futures = "0.3"
+object_store = { version = "0.12", features = ["aws"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

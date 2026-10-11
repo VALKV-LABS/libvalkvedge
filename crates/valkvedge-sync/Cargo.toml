@@ -1,0 +1,8 @@
+[package]
+name = "valkvedge-sync"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fjall.workspace = true
+object_store.workspace = true
