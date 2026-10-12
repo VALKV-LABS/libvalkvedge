@@ -1,0 +1,55 @@
+# Local S3 emulator and the integration test runner. Used by `make integ`.
+services:
+  s3:
+    image: localstack/localstack:4
+    environment:
+      SERVICES: s3
+    # Reachable from the host for browsing with the AWS CLI or an S3 client.
+    ports:
+      - "127.0.0.1:${VALKVEDGE_S3_PORT:-4566}:4566"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  s3-init:
+    image: localstack/localstack:4
+    depends_on:
+      s3:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["sh", "-c", "aws --endpoint-url=http://s3:4566 s3 mb s3://valkvedge-test || aws --endpoint-url=http://s3:4566 s3api head-bucket --bucket valkvedge-test"]
+
+  tests:
+    image: rust:1-bookworm
+    depends_on:
+      s3-init:
+        condition: service_completed_successfully
+    working_dir: /src
+    volumes:
+      - .:/src
+      - cargo:/usr/local/cargo/registry
+      - target:/target
+    environment:
+      CARGO_TARGET_DIR: /target
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT: http://s3:4566
+      AWS_ALLOW_HTTP: "true"
+      VALKVEDGE_TEST_S3_BUCKET: valkvedge-test
+    command: ["cargo", "test", "--locked", "-p", "valkvedge", "--test", "s3", "--", "--nocapture"]
+
+# Shared with the Makefile so builds are cached across targets. External, so
+# `make down` does not delete the build cache.
+volumes:
+  cargo:
+    name: vke-cargo
+    external: true
+  target:
+    name: vke-target
+    external: true
