@@ -76,7 +76,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Leave out `.object_store(...)` for a purely local database.
+Leave out `.object_store(...)` for a purely local database. To use a hosted service
+instead of your own bucket, replace it with `.remote(url, api_key)`: see
+[docs/hosted-api.md](docs/hosted-api.md).
 
 A second process follows the same database read-only:
 
@@ -129,6 +131,7 @@ db.sync().await?;                                 // pull what is new, any time
 | [Library components](docs/components.md) | The crates, and how reads, writes, conflicts, ownership and replicas work |
 | [Testing locally](docs/testing-locally.md) | Run the tests, try every feature by hand against an S3 emulator, look inside the bucket |
 | [Object format](docs/format.md) | Exactly what is stored in the object store |
+| [Hosted service](docs/hosted-api.md) | Connecting with a URL and an API key instead of your own object store, and the API the client speaks |
 
 ## Command line
 

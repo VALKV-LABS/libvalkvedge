@@ -291,6 +291,17 @@ One error type, `valkvedge::ValkvEdgeError`, with a stable `code()` for programs
 message for people. The codes are listed in
 [`error.rs`](../crates/valkvedge-log/src/error.rs).
 
+## Without an object store of your own
+
+The same `valkvedge` API can run against a hosted service: `Builder::remote(url,
+api_key)`. The local store, the outbox, the overlay and encryption are unchanged. What
+is replaced is the bottom of the stack: instead of `valkvedge-sync` and `valkvedge-log`
+reading and writing the object store, a small HTTP client
+([`remote.rs`](../crates/valkvedge/src/remote.rs)) sends sync writes and outbox entries
+to the service and asks it for frames and snapshots. The frames and snapshot parts it
+receives are in the same formats, checked the same way. See
+[hosted-api.md](hosted-api.md).
+
 ## Not here yet
 
 - Group commit: each sync write is currently one object.

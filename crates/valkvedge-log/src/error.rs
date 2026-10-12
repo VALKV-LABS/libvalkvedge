@@ -92,6 +92,16 @@ pub enum Error {
     /// A pushed operation was refused. See [`RejectReason`].
     #[error("write rejected: {0:?}")]
     Rejected(RejectReason),
+    /// A hosted service refused the request. `code` is the service's own
+    /// stable code, for example `UNAUTHENTICATED`, `STORAGE_QUOTA_EXCEEDED`
+    /// or `RATE_LIMITED`.
+    #[error("{message} ({code})")]
+    Service {
+        /// The service's error code.
+        code: &'static str,
+        /// The service's explanation.
+        message: String,
+    },
     /// The requested feature is not available in this build or mode.
     #[error("unsupported: {0}")]
     Unsupported(String),
@@ -118,6 +128,7 @@ impl Error {
             Error::InvalidEncryptionKey(_) => "INVALID_ENCRYPTION_KEY",
             Error::Rejected(RejectReason::ClockSkew) => "CLOCK_SKEW",
             Error::Rejected(RejectReason::StaleWrite) => "STALE_WRITE",
+            Error::Service { code, .. } => code,
             Error::Unsupported(_) => "UNSUPPORTED",
         }
     }
