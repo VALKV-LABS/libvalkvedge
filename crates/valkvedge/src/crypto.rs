@@ -84,8 +84,8 @@ impl Cipher {
     }
 
     pub(crate) fn verify_check(&self, check: &str) -> Result<()> {
-        let bytes = unhex(check)
-            .ok_or_else(|| Error::corrupt("encryption marker is not valid hex"))?;
+        let bytes =
+            unhex(check).ok_or_else(|| Error::corrupt("encryption marker is not valid hex"))?;
         match self.open(CHECK_KEY, &bytes) {
             Ok(plain) if plain == CHECK_PLAINTEXT => Ok(()),
             _ => Err(Error::InvalidEncryptionKey(
@@ -155,7 +155,10 @@ mod tests {
     #[test]
     fn same_plaintext_seals_differently_each_time() {
         let cipher = Cipher::new(&[7; 32], "db");
-        assert_ne!(cipher.seal(b"k", b"v").unwrap(), cipher.seal(b"k", b"v").unwrap());
+        assert_ne!(
+            cipher.seal(b"k", b"v").unwrap(),
+            cipher.seal(b"k", b"v").unwrap()
+        );
     }
 
     #[test]

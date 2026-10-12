@@ -4,9 +4,7 @@ use object_store::memory::InMemory;
 use object_store::ObjectStore;
 use std::sync::Arc;
 use std::time::Duration;
-use valkvedge::{
-    object_store, Durability, LeaseConfig, Options, Role, ValkvEdge, WriteOutcome,
-};
+use valkvedge::{object_store, Durability, LeaseConfig, Options, Role, ValkvEdge, WriteOutcome};
 
 fn options() -> Options {
     Options {
@@ -44,7 +42,15 @@ async fn all_bytes(store: &Arc<InMemory>) -> Vec<u8> {
     let listed: Vec<_> = store.list(None).try_collect().await.unwrap();
     let mut out = Vec::new();
     for meta in listed {
-        out.extend_from_slice(&store.get(&meta.location).await.unwrap().bytes().await.unwrap());
+        out.extend_from_slice(
+            &store
+                .get(&meta.location)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        );
     }
     out
 }
@@ -96,7 +102,11 @@ async fn a_replica_opens_and_reads_offline_once_it_has_a_local_copy() {
         .put(b"k", b"v")
         .await
         .unwrap();
-    client(&rdir, &store, Role::Replica).database("app").open().await.unwrap();
+    client(&rdir, &store, Role::Replica)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
 
     // Same local directory, but an object store that has nothing in it:
     // any network access would fail with NOT_FOUND.
@@ -130,12 +140,23 @@ async fn buffered_writes_are_readable_at_once_and_need_no_network() {
 
     assert_eq!(db.flush().await.unwrap(), 2);
     let status = db.status().unwrap();
-    assert_eq!((status.outbox_entries, status.outbox_bytes, status.applied_lsn), (0, 0, 2));
+    assert_eq!(
+        (
+            status.outbox_entries,
+            status.outbox_bytes,
+            status.applied_lsn
+        ),
+        (0, 0, 2)
+    );
     assert_eq!(text(db.get(b"t1").unwrap()).as_deref(), Some("21.5"));
     assert!(db.take_events().is_empty());
 
     let rdir = tempfile::tempdir().unwrap();
-    let follower = client(&rdir, &store, Role::Replica).database("telemetry").open().await.unwrap();
+    let follower = client(&rdir, &store, Role::Replica)
+        .database("telemetry")
+        .open()
+        .await
+        .unwrap();
     assert_eq!(text(follower.get(b"t2").unwrap()).as_deref(), Some("22.0"));
 }
 
@@ -143,13 +164,20 @@ async fn buffered_writes_are_readable_at_once_and_need_no_network() {
 async fn pending_buffered_writes_overlay_replicated_data_in_reads_and_scans() {
     let store = Arc::new(InMemory::new());
     let dir = tempfile::tempdir().unwrap();
-    let db = client(&dir, &store, Role::Writer).database("app").open().await.unwrap();
+    let db = client(&dir, &store, Role::Writer)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
     db.put(b"a", b"synced").await.unwrap();
     db.put(b"b", b"synced").await.unwrap();
     db.put(b"c", b"synced").await.unwrap();
 
     let mut batch = db.batch();
-    batch.put(b"a", b"pending").delete(b"b").put(b"d", b"pending");
+    batch
+        .put(b"a", b"pending")
+        .delete(b"b")
+        .put(b"d", b"pending");
     batch.commit_with(Durability::Buffered).await.unwrap();
 
     assert_eq!(text(db.get(b"a").unwrap()).as_deref(), Some("pending"));
@@ -181,7 +209,11 @@ async fn pending_buffered_writes_overlay_replicated_data_in_reads_and_scans() {
 async fn a_buffered_write_that_loses_a_conflict_is_reported() {
     let store = Arc::new(InMemory::new());
     let dir = tempfile::tempdir().unwrap();
-    let db = client(&dir, &store, Role::Writer).database("app").open().await.unwrap();
+    let db = client(&dir, &store, Role::Writer)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
 
     let mut batch = db.batch();
     batch.put(b"title", b"draft").put(b"body", b"draft");
@@ -211,7 +243,12 @@ async fn the_outbox_survives_a_restart_and_is_pushed_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
     {
         let kv = client(&dir, &store, Role::Writer);
-        let db = kv.database("app").durability(Durability::Buffered).open().await.unwrap();
+        let db = kv
+            .database("app")
+            .durability(Durability::Buffered)
+            .open()
+            .await
+            .unwrap();
         db.put(b"k", b"v").await.unwrap();
         kv.close().await.unwrap();
     }
@@ -237,7 +274,12 @@ async fn the_outbox_is_bounded() {
         .object_store(store.clone(), "tenant")
         .build()
         .unwrap();
-    let db = kv.database("app").durability(Durability::Buffered).open().await.unwrap();
+    let db = kv
+        .database("app")
+        .durability(Durability::Buffered)
+        .open()
+        .await
+        .unwrap();
     let mut refused = None;
     for i in 0..100u32 {
         if let Err(e) = db.put(&i.to_be_bytes(), &[0; 512]).await {
@@ -263,7 +305,12 @@ async fn background_task_pushes_the_outbox_on_its_own() {
         .object_store(store.clone(), "tenant")
         .build()
         .unwrap();
-    let db = kv.database("app").durability(Durability::Buffered).open().await.unwrap();
+    let db = kv
+        .database("app")
+        .durability(Durability::Buffered)
+        .open()
+        .await
+        .unwrap();
     db.put(b"k", b"v").await.unwrap();
     for _ in 0..100 {
         if db.status().unwrap().outbox_entries == 0 {
@@ -279,7 +326,11 @@ async fn background_task_pushes_the_outbox_on_its_own() {
 async fn compaction_lets_a_new_replica_boot_from_the_snapshot() {
     let store = Arc::new(InMemory::new());
     let (wdir, rdir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let db = client(&wdir, &store, Role::Writer).database("app").open().await.unwrap();
+    let db = client(&wdir, &store, Role::Writer)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
     for i in 0..50u32 {
         db.put(format!("k{i:03}").as_bytes(), b"v").await.unwrap();
     }
@@ -288,12 +339,19 @@ async fn compaction_lets_a_new_replica_boot_from_the_snapshot() {
     db.put(b"after", b"compaction").await.unwrap();
     assert_eq!(db.status().unwrap().generation, 1);
 
-    let follower = client(&rdir, &store, Role::Replica).database("app").open().await.unwrap();
+    let follower = client(&rdir, &store, Role::Replica)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
     let status = follower.status().unwrap();
     assert_eq!((status.generation, status.applied_lsn), (1, 52));
     assert_eq!(follower.range::<&str, _>(..).unwrap().count(), 50);
     assert_eq!(follower.get(b"k000").unwrap(), None);
-    assert_eq!(text(follower.get(b"after").unwrap()).as_deref(), Some("compaction"));
+    assert_eq!(
+        text(follower.get(b"after").unwrap()).as_deref(),
+        Some("compaction")
+    );
 }
 
 #[tokio::test]
@@ -301,7 +359,13 @@ async fn a_second_process_takes_over_after_a_clean_close_without_waiting() {
     let store = Arc::new(InMemory::new());
     let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let a = client(&dir_a, &store, Role::Writer);
-    a.database("app").open().await.unwrap().put(b"from", b"a").await.unwrap();
+    a.database("app")
+        .open()
+        .await
+        .unwrap()
+        .put(b"from", b"a")
+        .await
+        .unwrap();
     a.close().await.unwrap();
 
     let b = client(&dir_b, &store, Role::Writer);
@@ -309,8 +373,15 @@ async fn a_second_process_takes_over_after_a_clean_close_without_waiting() {
     // The lease is taken on the first write, so that is what is timed.
     let started = std::time::Instant::now();
     assert_eq!(db.put(b"also", b"b").await.unwrap().lsn, Some(2));
-    assert!(started.elapsed() < Duration::from_millis(250), "no lease wait after a clean close");
-    assert_eq!(text(db.get(b"from").unwrap()).as_deref(), Some("a"), "b caught up before writing");
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "no lease wait after a clean close"
+    );
+    assert_eq!(
+        text(db.get(b"from").unwrap()).as_deref(),
+        Some("a"),
+        "b caught up before writing"
+    );
 }
 
 #[tokio::test]
@@ -375,8 +446,15 @@ async fn encrypted_values_never_reach_the_object_store_in_clear() {
     let store = Arc::new(InMemory::new());
     let (wdir, rdir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let writer = client(&wdir, &store, Role::Writer);
-    let db = writer.database("vault").encryption_key([9; 32]).open().await.unwrap();
-    db.put(b"card-number", b"4111-1111-1111-1111").await.unwrap();
+    let db = writer
+        .database("vault")
+        .encryption_key([9; 32])
+        .open()
+        .await
+        .unwrap();
+    db.put(b"card-number", b"4111-1111-1111-1111")
+        .await
+        .unwrap();
     let mut buffered = db.batch();
     buffered.put(b"cvv", b"TOP-SECRET-737");
     buffered.commit_with(Durability::Buffered).await.unwrap();
@@ -386,11 +464,22 @@ async fn encrypted_values_never_reach_the_object_store_in_clear() {
     let stored = all_bytes(&store).await;
     assert!(!contains(&stored, b"4111-1111"));
     assert!(!contains(&stored, b"TOP-SECRET"));
-    assert!(contains(&stored, b"card-number"), "keys are not encrypted, by design");
+    assert!(
+        contains(&stored, b"card-number"),
+        "keys are not encrypted, by design"
+    );
 
     let replica = client(&rdir, &store, Role::Replica);
-    let follower = replica.database("vault").encryption_key([9; 32]).open().await.unwrap();
-    assert_eq!(text(follower.get(b"cvv").unwrap()).as_deref(), Some("TOP-SECRET-737"));
+    let follower = replica
+        .database("vault")
+        .encryption_key([9; 32])
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(
+        text(follower.get(b"cvv").unwrap()).as_deref(),
+        Some("TOP-SECRET-737")
+    );
 
     for wrong in [Some([1; 32]), None] {
         let dir = tempfile::tempdir().unwrap();
@@ -399,6 +488,9 @@ async fn encrypted_values_never_reach_the_object_store_in_clear() {
         if let Some(key) = wrong {
             builder = builder.encryption_key(key);
         }
-        assert_eq!(builder.open().await.err().unwrap().code(), "INVALID_ENCRYPTION_KEY");
+        assert_eq!(
+            builder.open().await.err().unwrap().code(),
+            "INVALID_ENCRYPTION_KEY"
+        );
     }
 }

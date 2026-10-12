@@ -26,7 +26,10 @@ async fn put_get_delete_and_scans() {
 
     assert_eq!(
         pairs(db.prefix(b"user:").unwrap()),
-        vec![("user:1".into(), "ada".into()), ("user:2".into(), "grace".into())]
+        vec![
+            ("user:1".into(), "ada".into()),
+            ("user:2".into(), "grace".into())
+        ]
     );
     assert_eq!(pairs(db.range("user:2".."zzz").unwrap()).len(), 2);
     assert_eq!(pairs(db.range::<&str, _>(..).unwrap()).len(), 3);
@@ -71,7 +74,15 @@ async fn data_survives_a_restart() {
 async fn limits_and_names_are_enforced() {
     let dir = tempfile::tempdir().unwrap();
     let kv = ValkvEdge::builder(dir.path()).build().unwrap();
-    for bad in ["", "a", "Upper", "1abc", "has space", "../escape", &"x".repeat(49)] {
+    for bad in [
+        "",
+        "a",
+        "Upper",
+        "1abc",
+        "has space",
+        "../escape",
+        &"x".repeat(49),
+    ] {
         let err = kv.database(bad).open().await.err().expect(bad);
         assert_eq!(err.code(), "INVALID_NAME");
     }
@@ -79,7 +90,10 @@ async fn limits_and_names_are_enforced() {
     let code = |r: valkvedge::Result<valkvedge::Commit>| r.unwrap_err().code();
     assert_eq!(code(db.put(b"", b"v").await), "KEY_TOO_LARGE");
     assert_eq!(code(db.put(&[b'k'; 1025], b"v").await), "KEY_TOO_LARGE");
-    assert_eq!(code(db.put(b"k", &vec![0; 1024 * 1024 + 1]).await), "VALUE_TOO_LARGE");
+    assert_eq!(
+        code(db.put(b"k", &vec![0; 1024 * 1024 + 1]).await),
+        "VALUE_TOO_LARGE"
+    );
     let mut batch = db.batch();
     for i in 0..5u8 {
         batch.put(&[i], &vec![0; 1024 * 1024]);
@@ -104,7 +118,10 @@ async fn databases_are_isolated_from_each_other() {
 #[tokio::test]
 async fn open_handles_stay_bounded_and_evicted_databases_reopen_transparently() {
     let dir = tempfile::tempdir().unwrap();
-    let kv = ValkvEdge::builder(dir.path()).max_open_databases(3).build().unwrap();
+    let kv = ValkvEdge::builder(dir.path())
+        .max_open_databases(3)
+        .build()
+        .unwrap();
     let mut handles = Vec::new();
     for i in 0..12 {
         let db = kv.database(&format!("db-{i:02}")).open().await.unwrap();
@@ -113,7 +130,10 @@ async fn open_handles_stay_bounded_and_evicted_databases_reopen_transparently() 
         handles.push(db);
     }
     assert!(kv.evictions() >= 9);
-    assert!(!handles[0].is_open(), "the least recently used database was closed");
+    assert!(
+        !handles[0].is_open(),
+        "the least recently used database was closed"
+    );
 
     // Every handle still works; using it reopens the store.
     for (i, db) in handles.iter().enumerate() {
@@ -130,7 +150,10 @@ async fn a_database_in_use_is_never_closed_and_the_open_fails_cleanly() {
         open_wait_timeout: Duration::from_millis(100),
         ..Options::default()
     };
-    let kv = ValkvEdge::builder(dir.path()).options(options).build().unwrap();
+    let kv = ValkvEdge::builder(dir.path())
+        .options(options)
+        .build()
+        .unwrap();
     let a = kv.database("aa").open().await.unwrap();
     let b = kv.database("bb").open().await.unwrap();
     a.put(b"k", b"v").await.unwrap();
@@ -153,14 +176,25 @@ async fn encrypted_database_rejects_a_wrong_or_missing_key() {
     let dir = tempfile::tempdir().unwrap();
     {
         let kv = ValkvEdge::builder(dir.path()).build().unwrap();
-        let db = kv.database("vault").encryption_key([1; 32]).open().await.unwrap();
+        let db = kv
+            .database("vault")
+            .encryption_key([1; 32])
+            .open()
+            .await
+            .unwrap();
         db.put(b"pin", b"1234").await.unwrap();
         assert_eq!(db.get(b"pin").unwrap().as_deref(), Some(&b"1234"[..]));
         assert_eq!(pairs(db.prefix(b"p").unwrap())[0].1, "1234");
     }
     {
         let kv = ValkvEdge::builder(dir.path()).build().unwrap();
-        let err = kv.database("vault").encryption_key([2; 32]).open().await.err().unwrap();
+        let err = kv
+            .database("vault")
+            .encryption_key([2; 32])
+            .open()
+            .await
+            .err()
+            .unwrap();
         assert_eq!(err.code(), "INVALID_ENCRYPTION_KEY");
     }
     {
@@ -169,7 +203,12 @@ async fn encrypted_database_rejects_a_wrong_or_missing_key() {
         assert_eq!(err.code(), "INVALID_ENCRYPTION_KEY");
     }
     let kv = ValkvEdge::builder(dir.path()).build().unwrap();
-    let db = kv.database("vault").encryption_key([1; 32]).open().await.unwrap();
+    let db = kv
+        .database("vault")
+        .encryption_key([1; 32])
+        .open()
+        .await
+        .unwrap();
     assert_eq!(db.get(b"pin").unwrap().as_deref(), Some(&b"1234"[..]));
 }
 
@@ -178,9 +217,21 @@ async fn a_plaintext_database_cannot_be_reopened_with_a_key() {
     let dir = tempfile::tempdir().unwrap();
     {
         let kv = ValkvEdge::builder(dir.path()).build().unwrap();
-        kv.database("plain").open().await.unwrap().put(b"k", b"v").await.unwrap();
+        kv.database("plain")
+            .open()
+            .await
+            .unwrap()
+            .put(b"k", b"v")
+            .await
+            .unwrap();
     }
     let kv = ValkvEdge::builder(dir.path()).build().unwrap();
-    let err = kv.database("plain").encryption_key([1; 32]).open().await.err().unwrap();
+    let err = kv
+        .database("plain")
+        .encryption_key([1; 32])
+        .open()
+        .await
+        .err()
+        .unwrap();
     assert_eq!(err.code(), "INVALID_ENCRYPTION_KEY");
 }

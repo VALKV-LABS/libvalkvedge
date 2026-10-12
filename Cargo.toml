@@ -39,4 +39,3 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
-missing_docs = "warn"

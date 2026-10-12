@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Format and clippy
+        run: make lint
+      - name: Unit and in-process tests
+        run: make unit
+      - name: Integration tests against the S3 emulator
+        run: make integ
+      - name: Stop the emulator
+        if: always()
+        run: make down

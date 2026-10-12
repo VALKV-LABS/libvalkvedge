@@ -74,7 +74,10 @@ impl LocalStore {
             .cache_size(cache_bytes)
             .open()
             .map_err(local)?;
-        let ks = |name: &str| db.keyspace(name, KeyspaceCreateOptions::default).map_err(local);
+        let ks = |name: &str| {
+            db.keyspace(name, KeyspaceCreateOptions::default)
+                .map_err(local)
+        };
         Ok(LocalStore {
             data: ks("data")?,
             meta: ks("meta")?,
@@ -294,7 +297,7 @@ impl StateStore for LocalStore {
     }
 
     fn needs_bootstrap(&self) -> Result<bool> {
-        Ok(self.meta.contains_key(RESETTING).map_err(local)?)
+        self.meta.contains_key(RESETTING).map_err(local)
     }
 
     fn apply(&self, frames: &[Frame], pos: ChainPos) -> Result<()> {
@@ -357,7 +360,11 @@ impl StateStore for LocalStore {
                     value,
                     hlc,
                     tombstone,
-                } => batch.insert(&self.data, key.as_slice(), encode_entry(*tombstone, hlc, value)),
+                } => batch.insert(
+                    &self.data,
+                    key.as_slice(),
+                    encode_entry(*tombstone, hlc, value),
+                ),
                 Record::Watermark { device, seq } => {
                     batch.insert(&self.devices, device.0.to_vec(), seq.to_le_bytes().to_vec())
                 }

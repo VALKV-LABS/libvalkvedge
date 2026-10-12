@@ -17,7 +17,12 @@ fn fast() -> LeaseConfig {
     }
 }
 
-async fn writer_on(store: &Store, node_id: &str, state: Arc<MemState>, wait: bool) -> Writer<MemState> {
+async fn writer_on(
+    store: &Store,
+    node_id: &str,
+    state: Arc<MemState>,
+    wait: bool,
+) -> Writer<MemState> {
     writer_with(store, node_id, state, wait, WriterConfig::default()).await
 }
 
@@ -28,7 +33,9 @@ async fn writer_with(
     wait: bool,
     config: WriterConfig,
 ) -> Writer<MemState> {
-    let node = Node::start(store.clone(), node_id, "addr", fast()).await.unwrap();
+    let node = Node::start(store.clone(), node_id, "addr", fast())
+        .await
+        .unwrap();
     Writer::open(
         store.clone(),
         Layout::new("db"),
@@ -72,7 +79,9 @@ fn stamped(key: &str, value: &str, ms: u64, device: DeviceId) -> Op {
 }
 
 fn get(state: &MemState, key: &str) -> Option<String> {
-    state.get(key.as_bytes()).map(|v| String::from_utf8(v).unwrap())
+    state
+        .get(key.as_bytes())
+        .map(|v| String::from_utf8(v).unwrap())
 }
 
 #[tokio::test]
@@ -84,7 +93,10 @@ async fn replica_follows_the_writer_incrementally() {
 
     let replica = MemState::new();
     let first = pull(&store, &layout, &replica).await.unwrap();
-    assert_eq!((first.applied_lsn, first.frames, first.bootstrapped), (1, 1, false));
+    assert_eq!(
+        (first.applied_lsn, first.frames, first.bootstrapped),
+        (1, 1, false)
+    );
     assert_eq!(get(&replica, "k1").as_deref(), Some("v1"));
 
     w.commit(vec![put("k2", "v2"), del("k1")]).await.unwrap();
@@ -112,7 +124,9 @@ async fn new_replica_cold_boots_from_the_snapshot_not_from_history() {
     let layout = Layout::new("db");
     let w = writer_on(&store, "a", Arc::new(MemState::new()), false).await;
     for i in 0..20 {
-        w.commit(vec![put(&format!("k{i:02}"), "old")]).await.unwrap();
+        w.commit(vec![put(&format!("k{i:02}"), "old")])
+            .await
+            .unwrap();
     }
     w.compact().await.unwrap();
     w.commit(vec![put("k00", "new")]).await.unwrap();
@@ -120,7 +134,10 @@ async fn new_replica_cold_boots_from_the_snapshot_not_from_history() {
     let replica = MemState::new();
     let outcome = pull(&store, &layout, &replica).await.unwrap();
     assert!(outcome.bootstrapped);
-    assert_eq!(outcome.frames, 1, "only the frame after the snapshot is replayed");
+    assert_eq!(
+        outcome.frames, 1,
+        "only the frame after the snapshot is replayed"
+    );
     assert_eq!(outcome.applied_lsn, 21);
     assert_eq!(get(&replica, "k00").as_deref(), Some("new"));
     assert_eq!(get(&replica, "k19").as_deref(), Some("old"));
@@ -141,7 +158,10 @@ async fn replica_one_generation_behind_catches_up_from_frames() {
     w.commit(vec![put("c", "3")]).await.unwrap();
 
     let outcome = pull(&store, &layout, &replica).await.unwrap();
-    assert!(!outcome.bootstrapped, "old generation is still within its grace period");
+    assert!(
+        !outcome.bootstrapped,
+        "old generation is still within its grace period"
+    );
     assert_eq!(outcome.applied_lsn, 3);
     assert_eq!(replica.position().unwrap().generation, 1);
     assert_eq!(get(&replica, "c").as_deref(), Some("3"));
@@ -315,7 +335,10 @@ async fn clock_skew_and_stale_writes_are_rejected_and_reported() {
     );
     assert_eq!(get(&state, "future"), None);
     assert_eq!(get(&state, "ancient"), None);
-    assert_eq!(report.watermark, 1, "the entry is settled even though ops were refused");
+    assert_eq!(
+        report.watermark, 1,
+        "the entry is settled even though ops were refused"
+    );
 }
 
 #[tokio::test]
@@ -386,7 +409,9 @@ async fn watermarks_survive_compaction() {
 async fn no_acknowledged_write_is_lost_when_the_owner_dies() {
     let store = Store::memory();
     let layout = Layout::new("db");
-    let node_a = Node::start(store.clone(), "a", "addr", fast()).await.unwrap();
+    let node_a = Node::start(store.clone(), "a", "addr", fast())
+        .await
+        .unwrap();
     let a = Writer::open(
         store.clone(),
         layout.clone(),
@@ -399,7 +424,9 @@ async fn no_acknowledged_write_is_lost_when_the_owner_dies() {
     .await
     .unwrap();
     for i in 0..5 {
-        a.commit(vec![put(&format!("k{i}"), "acked")]).await.unwrap();
+        a.commit(vec![put(&format!("k{i}"), "acked")])
+            .await
+            .unwrap();
     }
 
     // Node a dies without releasing. Node b is refused at first, then takes
@@ -430,7 +457,9 @@ async fn compaction_drops_expired_tombstones_only() {
         ..WriterConfig::default()
     };
     let w = writer_with(&store, "a", state.clone(), false, config).await;
-    w.commit(vec![put("old", "v"), put("keep", "v")]).await.unwrap();
+    w.commit(vec![put("old", "v"), put("keep", "v")])
+        .await
+        .unwrap();
     w.commit(vec![del("old")]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
     w.commit(vec![put("fresh", "v")]).await.unwrap();
@@ -438,7 +467,11 @@ async fn compaction_drops_expired_tombstones_only() {
     assert_eq!(state.len_with_tombstones(), 3);
 
     w.compact().await.unwrap();
-    assert_eq!(state.len_with_tombstones(), 2, "the expired tombstone is gone locally");
+    assert_eq!(
+        state.len_with_tombstones(),
+        2,
+        "the expired tombstone is gone locally"
+    );
 
     let replica = MemState::new();
     pull(&store, &layout, &replica).await.unwrap();

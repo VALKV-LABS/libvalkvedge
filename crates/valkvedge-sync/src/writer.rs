@@ -217,7 +217,11 @@ impl<S: StateStore> Writer<S> {
     /// Each entry becomes one frame holding the operations that won. An entry
     /// at or below the device's watermark is reported as a duplicate and not
     /// applied again, so a retried push is safe.
-    pub async fn push(&self, device: DeviceId, mut entries: Vec<OutboxEntry>) -> Result<PushReport> {
+    pub async fn push(
+        &self,
+        device: DeviceId,
+        mut entries: Vec<OutboxEntry>,
+    ) -> Result<PushReport> {
         let mut guard = self.log.lock().await;
         let log = guard.as_mut().ok_or(Error::Fenced)?;
         entries.sort_by_key(|e| e.seq);

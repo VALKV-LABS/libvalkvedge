@@ -127,7 +127,9 @@ impl Segment {
             return Err(Error::corrupt("trailing bytes in segment"));
         }
         if count > 0 && last_lsn != first_lsn + count as u64 - 1 {
-            return Err(Error::corrupt("segment LSN range does not match its frames"));
+            return Err(Error::corrupt(
+                "segment LSN range does not match its frames",
+            ));
         }
         Ok((
             Segment {
@@ -482,7 +484,10 @@ mod tests {
         let mut manifest = Manifest::empty();
         manifest.generation = 3;
         manifest.snapshot_lsn = 77;
-        assert_eq!(Manifest::from_bytes(&manifest.to_bytes()).unwrap(), manifest);
+        assert_eq!(
+            Manifest::from_bytes(&manifest.to_bytes()).unwrap(),
+            manifest
+        );
         manifest.format_version = FORMAT_VERSION + 1;
         assert!(Manifest::from_bytes(&manifest.to_bytes()).is_err());
     }

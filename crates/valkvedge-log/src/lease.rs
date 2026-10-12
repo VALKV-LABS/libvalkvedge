@@ -11,10 +11,10 @@ use crate::format::{node_key, Layout};
 use crate::store::{PutOutcome, Store};
 use crate::types::now_ms;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 /// Timing parameters for heartbeats and leases.
@@ -288,7 +288,10 @@ async fn wait_until_stale(
         return Err(held());
     }
     let started = Instant::now();
-    let poll = config.heartbeat_interval.min(config.lease_ttl / 4).max(Duration::from_millis(1));
+    let poll = config
+        .heartbeat_interval
+        .min(config.lease_ttl / 4)
+        .max(Duration::from_millis(1));
     while started.elapsed() < config.lease_ttl {
         tokio::time::sleep(poll).await;
         let now = read_heartbeat(store, &lease.node_id).await?;
@@ -342,8 +345,12 @@ mod tests {
     async fn first_node_acquires_and_second_is_refused() {
         let store = Store::memory();
         let layout = Layout::new("db");
-        let a = Node::start(store.clone(), "a", "a:1", fast()).await.unwrap();
-        let b = Node::start(store.clone(), "b", "b:1", fast()).await.unwrap();
+        let a = Node::start(store.clone(), "a", "a:1", fast())
+            .await
+            .unwrap();
+        let b = Node::start(store.clone(), "b", "b:1", fast())
+            .await
+            .unwrap();
 
         let lease = acquire(&store, &layout, &a, false).await.unwrap();
         assert_eq!(lease.record.lease_epoch, 1);
@@ -358,8 +365,12 @@ mod tests {
     async fn released_lease_is_taken_immediately_with_higher_epoch() {
         let store = Store::memory();
         let layout = Layout::new("db");
-        let a = Node::start(store.clone(), "a", "a:1", fast()).await.unwrap();
-        let b = Node::start(store.clone(), "b", "b:1", fast()).await.unwrap();
+        let a = Node::start(store.clone(), "a", "a:1", fast())
+            .await
+            .unwrap();
+        let b = Node::start(store.clone(), "b", "b:1", fast())
+            .await
+            .unwrap();
         acquire(&store, &layout, &a, false)
             .await
             .unwrap()
@@ -375,8 +386,12 @@ mod tests {
     async fn dead_owner_is_taken_over_after_ttl_and_old_lease_cannot_release() {
         let store = Store::memory();
         let layout = Layout::new("db");
-        let a = Node::start(store.clone(), "a", "a:1", fast()).await.unwrap();
-        let b = Node::start(store.clone(), "b", "b:1", fast()).await.unwrap();
+        let a = Node::start(store.clone(), "a", "a:1", fast())
+            .await
+            .unwrap();
+        let b = Node::start(store.clone(), "b", "b:1", fast())
+            .await
+            .unwrap();
         let old = acquire(&store, &layout, &a, false).await.unwrap();
         a.stop_heartbeat();
 
@@ -391,14 +406,20 @@ mod tests {
     async fn restarted_owner_is_taken_over_without_waiting() {
         let store = Store::memory();
         let layout = Layout::new("db");
-        let a1 = Node::start(store.clone(), "a", "a:1", fast()).await.unwrap();
+        let a1 = Node::start(store.clone(), "a", "a:1", fast())
+            .await
+            .unwrap();
         acquire(&store, &layout, &a1, false).await.unwrap();
         a1.stop_heartbeat();
         tokio::time::sleep(Duration::from_millis(5)).await;
         // Same node id, new process: a newer epoch in the heartbeat object.
-        let restarted = Node::start(store.clone(), "a", "a:1", fast()).await.unwrap();
+        let restarted = Node::start(store.clone(), "a", "a:1", fast())
+            .await
+            .unwrap();
         assert!(restarted.epoch() > a1.epoch());
-        let b = Node::start(store.clone(), "b", "b:1", fast()).await.unwrap();
+        let b = Node::start(store.clone(), "b", "b:1", fast())
+            .await
+            .unwrap();
         let lease = acquire(&store, &layout, &b, false).await.unwrap();
         assert_eq!(lease.record.node_id, "b");
     }

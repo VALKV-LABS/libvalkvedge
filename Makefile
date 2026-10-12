@@ -9,14 +9,17 @@ RUN     = docker run --rm -v "$(CURDIR)":/src -w /src \
 help: ## List the commands
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-10s %s\n", $$1, $$2}'
 
-up: ## Start the S3 emulator used by the integration tests
-	docker compose up -d --wait
+up: ## Start the S3 emulator and create its test bucket
+	@docker volume create vke-cargo >/dev/null && docker volume create vke-target >/dev/null
+	docker compose up -d --wait s3
+	docker compose run --rm s3-init
 
 unit: ## Unit and in-process tests (no external services)
 	$(RUN) cargo test --workspace --locked
 
 integ: ## Integration tests against the S3 emulator
-	docker compose up -d --wait
+	@docker volume create vke-cargo >/dev/null && docker volume create vke-target >/dev/null
+	docker compose up -d --wait s3
 	docker compose run --rm tests
 
 lint: ## Format check and clippy, warnings as errors

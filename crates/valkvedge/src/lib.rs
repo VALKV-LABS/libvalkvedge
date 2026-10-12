@@ -48,9 +48,7 @@ use valkvedge_log::{HlcClock, Layout, Node, Op, Store};
 use valkvedge_sync::{Change, OpOutcome, StateStore, Writer};
 
 pub use local::Iter;
-pub use valkvedge_log::{
-    Error as ValkvEdgeError, LeaseConfig, Lsn, OpKind, RejectReason, Result,
-};
+pub use valkvedge_log::{Error as ValkvEdgeError, LeaseConfig, Lsn, OpKind, RejectReason, Result};
 pub use valkvedge_sync::WriterConfig;
 
 /// Re-export of the object store crate, for building a store to pass to
@@ -269,7 +267,7 @@ struct Open {
 enum Session {
     Local,
     Replica,
-    Writer(Writer<LocalStore>),
+    Writer(Box<Writer<LocalStore>>),
 }
 
 impl Inner {
@@ -294,17 +292,16 @@ impl Inner {
     }
 
     async fn node(&self, store: &Store) -> Result<Node> {
-        let node = self
-            .node
-            .get_or_try_init(|| async {
-                let id = self
-                    .options
-                    .node_id
-                    .clone()
-                    .unwrap_or_else(|| format!("direct-{}", valkvedge_log::DeviceId::random()));
-                Node::start(store.clone(), id, "", self.options.lease.clone()).await
-            })
-            .await?;
+        let node =
+            self.node
+                .get_or_try_init(|| async {
+                    let id =
+                        self.options.node_id.clone().unwrap_or_else(|| {
+                            format!("direct-{}", valkvedge_log::DeviceId::random())
+                        });
+                    Node::start(store.clone(), id, "", self.options.lease.clone()).await
+                })
+                .await?;
         Ok(node.clone())
     }
 
@@ -403,7 +400,13 @@ impl Inner {
     }
 
     async fn tick(self: Arc<Self>) {
-        let all: Vec<Arc<Shared>> = self.dbs.lock().expect("dbs lock").values().cloned().collect();
+        let all: Vec<Arc<Shared>> = self
+            .dbs
+            .lock()
+            .expect("dbs lock")
+            .values()
+            .cloned()
+            .collect();
         let idle_ms = self.options.idle_close_after.as_millis() as u64;
         for shared in all {
             let db = Database {
@@ -423,7 +426,9 @@ impl Inner {
                 tracing::warn!(database = %shared.name, error = %e, "background sync failed");
             }
             drop(db);
-            let unused = self.now_ms().saturating_sub(shared.last_used_ms.load(Ordering::Relaxed));
+            let unused = self
+                .now_ms()
+                .saturating_sub(shared.last_used_ms.load(Ordering::Relaxed));
             if unused >= idle_ms && !shared.has_outbox.load(Ordering::Relaxed) {
                 self.close_if_idle(&shared);
             }
@@ -776,7 +781,7 @@ impl Database {
                         if let Some(check) = crypto::reconcile(cipher, stored.as_deref(), empty)? {
                             writer.set_encryption_check(Some(check)).await?;
                         }
-                        Session::Writer(writer)
+                        Session::Writer(Box::new(writer))
                     }
                 };
                 // Remember the verified key locally so a wrong key is caught
@@ -949,7 +954,10 @@ impl Database {
                 self.flush().await?;
             }
             Session::Replica => {
-                let (store, layout) = self.kv.layout(&self.shared.name).expect("replica has a store");
+                let (store, layout) = self
+                    .kv
+                    .layout(&self.shared.name)
+                    .expect("replica has a store");
                 valkvedge_sync::pull(&store, &layout, open.store.as_ref()).await?;
             }
         }
@@ -961,7 +969,9 @@ impl Database {
     pub async fn remote_lsn(&self) -> Result<Option<Lsn>> {
         match self.kv.layout(&self.shared.name) {
             None => Ok(None),
-            Some((store, layout)) => Ok(Some(valkvedge_sync::remote_head(&store, &layout).await?.1)),
+            Some((store, layout)) => {
+                Ok(Some(valkvedge_sync::remote_head(&store, &layout).await?.1))
+            }
         }
     }
 

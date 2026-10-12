@@ -199,8 +199,7 @@ impl LogWriter {
             };
 
             let generation = manifest.generation;
-            let segments =
-                read_segments(&store, &layout, generation, 0, 0, usize::MAX).await?;
+            let segments = read_segments(&store, &layout, generation, 0, 0, usize::MAX).await?;
             let mut pos = ChainPos {
                 generation,
                 next_seq: 0,
@@ -474,7 +473,9 @@ mod tests {
     }
 
     async fn node(store: &Store, id: &str) -> Node {
-        Node::start(store.clone(), id, "addr", fast()).await.unwrap()
+        Node::start(store.clone(), id, "addr", fast())
+            .await
+            .unwrap()
     }
 
     async fn read_all(store: &Store, layout: &Layout) -> Vec<Lsn> {
@@ -491,9 +492,14 @@ mod tests {
     async fn appended_frames_are_readable_in_order() {
         let store = Store::memory();
         let layout = Layout::new("db");
-        let mut w = LogWriter::open(store.clone(), layout.clone(), node(&store, "a").await, false)
-            .await
-            .unwrap();
+        let mut w = LogWriter::open(
+            store.clone(),
+            layout.clone(),
+            node(&store, "a").await,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(w.next_lsn(), 1);
         w.append(vec![frame(1), frame(2)]).await.unwrap();
         w.append(vec![frame(3)]).await.unwrap();
@@ -557,12 +563,23 @@ mod tests {
         // lease out from under it: fencing must not depend on a noticing.
         let stolen = old.lease.take().unwrap();
         stolen.release(&store).await.unwrap();
-        let mut new = LogWriter::open(store.clone(), layout.clone(), node(&store, "b").await, false)
-            .await
-            .unwrap();
+        let mut new = LogWriter::open(
+            store.clone(),
+            layout.clone(),
+            node(&store, "b").await,
+            false,
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(old.append(vec![frame(2)]).await.unwrap_err().code(), "FENCED");
-        assert_eq!(old.append(vec![frame(2)]).await.unwrap_err().code(), "FENCED");
+        assert_eq!(
+            old.append(vec![frame(2)]).await.unwrap_err().code(),
+            "FENCED"
+        );
+        assert_eq!(
+            old.append(vec![frame(2)]).await.unwrap_err().code(),
+            "FENCED"
+        );
         let upload = old.begin_snapshot();
         assert!(old.install_snapshot(upload).await.is_err());
 
@@ -574,9 +591,14 @@ mod tests {
     async fn snapshot_starts_a_new_generation_and_old_one_is_deleted_after_grace() {
         let store = Store::memory();
         let layout = Layout::new("db");
-        let mut w = LogWriter::open(store.clone(), layout.clone(), node(&store, "a").await, false)
-            .await
-            .unwrap();
+        let mut w = LogWriter::open(
+            store.clone(),
+            layout.clone(),
+            node(&store, "a").await,
+            false,
+        )
+        .await
+        .unwrap();
         w.append(vec![frame(1), frame(2)]).await.unwrap();
 
         let mut upload = w.begin_snapshot();
@@ -601,19 +623,32 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(read_all(&store, &layout).await, vec![3]);
 
-        assert!(!store.list(&layout.generation_prefix(0)).await.unwrap().is_empty());
+        assert!(!store
+            .list(&layout.generation_prefix(0))
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(w.delete_old_generations(60_000).await.unwrap(), 0);
         assert_eq!(w.delete_old_generations(0).await.unwrap(), 1);
-        assert!(store.list(&layout.generation_prefix(0)).await.unwrap().is_empty());
+        assert!(store
+            .list(&layout.generation_prefix(0))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
     async fn a_gap_or_broken_chain_is_reported_as_corrupt() {
         let store = Store::memory();
         let layout = Layout::new("db");
-        let mut w = LogWriter::open(store.clone(), layout.clone(), node(&store, "a").await, false)
-            .await
-            .unwrap();
+        let mut w = LogWriter::open(
+            store.clone(),
+            layout.clone(),
+            node(&store, "a").await,
+            false,
+        )
+        .await
+        .unwrap();
         w.append(vec![frame(1)]).await.unwrap();
         w.append(vec![frame(2)]).await.unwrap();
 

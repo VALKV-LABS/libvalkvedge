@@ -21,3 +21,6 @@ tracing.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 futures.workspace = true
+
+[lints]
+workspace = true
