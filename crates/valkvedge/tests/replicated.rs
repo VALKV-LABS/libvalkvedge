@@ -205,6 +205,216 @@ async fn pending_buffered_writes_overlay_replicated_data_in_reads_and_scans() {
     assert_eq!(db.range::<&str, _>(..).unwrap().count(), 3);
 }
 
+fn writer_at(dir: &tempfile::TempDir, store: &Arc<InMemory>, id: &str, addr: &str) -> ValkvEdge {
+    ValkvEdge::builder(dir.path())
+        .options(Options {
+            node_id: Some(id.to_string()),
+            node_addr: addr.to_string(),
+            // Do not wait when someone else owns a database: fail at once.
+            wait_for_lease: false,
+            ..options()
+        })
+        .object_store(store.clone(), "tenant")
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_owner_and_its_address_are_visible_and_a_live_owner_is_not_displaced() {
+    let store = Arc::new(InMemory::new());
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = writer_at(&dir_a, &store, "node-a", "10.0.0.1:7000");
+    let b = writer_at(&dir_b, &store, "node-b", "10.0.0.2:7000");
+    let on_a = a.database("app").open().await.unwrap();
+    let on_b = b.database("app").open().await.unwrap();
+    assert_eq!(on_b.owner().await.unwrap(), None, "nobody owns it yet");
+
+    on_a.put(b"k", b"1").await.unwrap();
+    let owner = on_b.owner().await.unwrap().unwrap();
+    assert_eq!(
+        (owner.node_id.as_str(), owner.node_addr.as_str()),
+        ("node-a", "10.0.0.1:7000")
+    );
+
+    // b is told at once, and even an explicit take-over is refused while a lives.
+    assert_eq!(on_b.put(b"k", b"2").await.unwrap_err().code(), "LEASE_HELD");
+    assert_eq!(on_b.take_over().await.unwrap_err().code(), "LEASE_HELD");
+    assert_eq!(text(on_a.get(b"k").unwrap()).as_deref(), Some("1"));
+
+    // After a clean close the lease is released: nobody owns it.
+    a.close().await.unwrap();
+    assert_eq!(on_b.owner().await.unwrap(), None);
+    on_b.put(b"k", b"3").await.unwrap();
+    assert_eq!(on_b.owner().await.unwrap().unwrap().node_id, "node-b");
+}
+
+#[tokio::test]
+async fn take_over_claims_a_database_whose_owner_died() {
+    let store = Arc::new(InMemory::new());
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    {
+        // Process a dies without releasing: its runtime and heartbeat stop.
+        let store = store.clone();
+        let path = dir_a.path().to_path_buf();
+        std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let a = ValkvEdge::builder(path)
+                    .options(Options {
+                        node_id: Some("node-a".into()),
+                        ..options()
+                    })
+                    .object_store(store, "tenant")
+                    .build()
+                    .unwrap();
+                a.database("app")
+                    .open()
+                    .await
+                    .unwrap()
+                    .put(b"k", b"acked")
+                    .await
+                    .unwrap();
+            });
+        })
+        .join()
+        .unwrap();
+    }
+    let b = writer_at(&dir_b, &store, "node-b", "10.0.0.2:7000");
+    let db = b.database("app").open().await.unwrap();
+    // Without waiting, the stale lease still looks held.
+    assert_eq!(db.put(b"k2", b"x").await.unwrap_err().code(), "LEASE_HELD");
+
+    let started = std::time::Instant::now();
+    db.take_over().await.unwrap();
+    assert!(
+        started.elapsed() >= options().lease.lease_ttl,
+        "it watched for a full TTL"
+    );
+    assert_eq!(
+        text(db.get(b"k").unwrap()).as_deref(),
+        Some("acked"),
+        "caught up on take-over"
+    );
+    assert_eq!(db.put(b"k2", b"after").await.unwrap().lsn, Some(2));
+    assert_eq!(db.owner().await.unwrap().unwrap().node_id, "node-b");
+}
+
+#[tokio::test]
+async fn namespaced_databases_have_their_own_prefix_and_replicate() {
+    use futures::TryStreamExt;
+    let store = Arc::new(InMemory::new());
+    let (wdir, rdir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let writer = client(&wdir, &store, Role::Writer);
+    let a = writer
+        .namespace("acme")
+        .database("orders")
+        .open()
+        .await
+        .unwrap();
+    let b = writer
+        .namespace("globex")
+        .database("orders")
+        .open()
+        .await
+        .unwrap();
+    a.put(b"k", b"acme").await.unwrap();
+    b.put(b"k", b"globex").await.unwrap();
+    assert_eq!(a.object_prefix().as_deref(), Some("tenant/acme/orders"));
+
+    let keys: Vec<String> = store
+        .list(None)
+        .map_ok(|m| m.location.to_string())
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(keys
+        .iter()
+        .any(|k| k.starts_with("tenant/acme/orders/gen/")));
+    assert!(keys
+        .iter()
+        .any(|k| k.starts_with("tenant/globex/orders/gen/")));
+    assert!(keys.iter().all(|k| k.starts_with("tenant/acme/")
+        || k.starts_with("tenant/globex/")
+        || k.starts_with("_nodes/")));
+
+    let replica = client(&rdir, &store, Role::Replica);
+    let follower = replica
+        .namespace("globex")
+        .database("orders")
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(text(follower.get(b"k").unwrap()).as_deref(), Some("globex"));
+}
+
+#[tokio::test]
+async fn the_writer_accepts_pushed_entries_from_other_devices() {
+    use valkvedge::{DeviceId, Hlc, Op, OpKind, OpOutcome, OutboxEntry};
+    let store = Arc::new(InMemory::new());
+    let (wdir, rdir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let db = client(&wdir, &store, Role::Writer)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    db.put(b"title", b"from-writer").await.unwrap();
+
+    let phone = DeviceId([7; 16]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let op = |key: &str, value: &str, ms: u64| Op {
+        kind: OpKind::Put,
+        key: key.as_bytes().to_vec(),
+        value: value.as_bytes().to_vec(),
+        hlc: Hlc {
+            physical_ms: ms,
+            counter: 0,
+            device: phone,
+        },
+    };
+    let entries = vec![OutboxEntry {
+        seq: 1,
+        ops: vec![
+            op("title", "stale-from-phone", now - 60_000),
+            op("note", "from-phone", now - 60_000),
+        ],
+    }];
+
+    let report = db.accept_push(phone, entries.clone()).await.unwrap();
+    assert_eq!(
+        report.entries,
+        vec![(1, vec![OpOutcome::Superseded, OpOutcome::Applied])]
+    );
+    assert_eq!(report.watermark, 1);
+    assert_eq!(
+        text(db.get(b"title").unwrap()).as_deref(),
+        Some("from-writer")
+    );
+    assert_eq!(
+        text(db.get(b"note").unwrap()).as_deref(),
+        Some("from-phone")
+    );
+
+    // The phone retries the same push: nothing is applied twice.
+    let retry = db.accept_push(phone, entries).await.unwrap();
+    assert_eq!(retry.entries[0].1, vec![OpOutcome::Duplicate; 2]);
+    assert_eq!(retry.lsn, report.lsn);
+
+    // A replica cannot accept pushes.
+    let follower = client(&rdir, &store, Role::Replica)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(
+        text(follower.get(b"note").unwrap()).as_deref(),
+        Some("from-phone")
+    );
+    let err = follower.accept_push(phone, Vec::new()).await.unwrap_err();
+    assert_eq!(err.code(), "READ_ONLY");
+}
+
 #[tokio::test]
 async fn a_buffered_write_made_after_a_sync_write_always_wins() {
     // Many rounds in quick succession, so writes land in the same millisecond.

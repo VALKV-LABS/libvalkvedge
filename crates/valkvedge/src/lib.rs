@@ -44,12 +44,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use valkvedge_log::{HlcClock, Layout, Node, Op, Store};
-use valkvedge_sync::{Change, OpOutcome, StateStore, Writer};
+use valkvedge_log::{HlcClock, Layout, Node, Store};
+use valkvedge_sync::{Change, StateStore, Writer};
 
 pub use local::Iter;
+pub use valkvedge_log::{DeviceId, Hlc, Op};
 pub use valkvedge_log::{Error as ValkvEdgeError, LeaseConfig, Lsn, OpKind, RejectReason, Result};
-pub use valkvedge_sync::WriterConfig;
+pub use valkvedge_sync::{OpOutcome, OutboxEntry, PushReport, WriterConfig};
 
 /// Re-export of the object store crate, for building a store to pass to
 /// [`Builder::object_store`].
@@ -115,6 +116,11 @@ pub struct Options {
     /// Identity of this process among those sharing the object store.
     /// Random when not set.
     pub node_id: Option<String>,
+    /// An address written into the leases this process takes, so other
+    /// processes sharing the object store can tell where the owner of a
+    /// database can be reached. Empty when not set. The library does not
+    /// connect to it.
+    pub node_addr: String,
     /// Run the background task that pushes outboxes, pulls replicas and
     /// closes idle databases.
     pub background: bool,
@@ -140,6 +146,7 @@ impl Default for Options {
             lease: LeaseConfig::default(),
             writer: WriterConfig::default(),
             node_id: None,
+            node_addr: String::new(),
             background: true,
             sync_write_timeout: Duration::from_secs(10),
         }
@@ -307,7 +314,13 @@ impl Inner {
                         self.options.node_id.clone().unwrap_or_else(|| {
                             format!("direct-{}", valkvedge_log::DeviceId::random())
                         });
-                    Node::start(store.clone(), id, "", self.options.lease.clone()).await
+                    Node::start(
+                        store.clone(),
+                        id,
+                        self.options.node_addr.clone(),
+                        self.options.lease.clone(),
+                    )
+                    .await
                 })
                 .await?;
         Ok(node.clone())
@@ -474,14 +487,29 @@ impl ValkvEdge {
 
     /// Starts opening the database called `name`.
     ///
-    /// Names are 2 to 48 characters: lowercase letters, digits and `-`,
-    /// starting with a letter.
+    /// Names are 2 to 64 characters: lowercase letters, digits and `-`,
+    /// starting with a letter or digit.
     pub fn database(&self, name: &str) -> DatabaseBuilder {
         DatabaseBuilder {
             kv: self.inner.clone(),
-            name: name.to_string(),
+            // A slash is only valid through `namespace`.
+            name: name.replace('/', "\0"),
             durability: Durability::default(),
             key: None,
+        }
+    }
+
+    /// A group of databases kept under their own directory locally and their
+    /// own prefix in the object store.
+    ///
+    /// Databases in different namespaces are unrelated even when they share a
+    /// name. Use it to keep one application's or one customer's databases
+    /// together, for example to delete them as a unit. Namespace names follow
+    /// the same rules as database names.
+    pub fn namespace(&self, namespace: &str) -> Namespace {
+        Namespace {
+            kv: self.inner.clone(),
+            namespace: namespace.replace('/', "\0"),
         }
     }
 
@@ -525,13 +553,38 @@ impl ValkvEdge {
     }
 }
 
-fn valid_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    (2..=48).contains(&bytes.len())
-        && bytes[0].is_ascii_lowercase()
+fn valid_part(part: &str) -> bool {
+    let bytes = part.as_bytes();
+    (2..=64).contains(&bytes.len())
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
         && bytes
             .iter()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// A database is identified by `name` or `namespace/name`.
+fn valid_name(name: &str) -> bool {
+    let mut parts = name.split('/');
+    let (first, second, third) = (parts.next(), parts.next(), parts.next());
+    third.is_none() && first.is_some_and(valid_part) && second.is_none_or(valid_part)
+}
+
+/// A group of databases. See [`ValkvEdge::namespace`].
+pub struct Namespace {
+    kv: Arc<Inner>,
+    namespace: String,
+}
+
+impl Namespace {
+    /// Starts opening the database called `name` in this namespace.
+    pub fn database(&self, name: &str) -> DatabaseBuilder {
+        DatabaseBuilder {
+            kv: self.kv.clone(),
+            name: format!("{}/{}", self.namespace, name.replace('/', "\0")),
+            durability: Durability::default(),
+            key: None,
+        }
+    }
 }
 
 /// Options for opening one database.
@@ -631,6 +684,15 @@ impl DatabaseBuilder {
         }
         Ok(db)
     }
+}
+
+/// The process that holds a database's lease. See [`Database::owner`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owner {
+    /// The owner's node id.
+    pub node_id: String,
+    /// The address the owner advertised, empty if it set none.
+    pub node_addr: String,
 }
 
 /// What a write returned.
@@ -765,7 +827,8 @@ impl Database {
         if let Some(session) = slot.as_ref() {
             return Ok(session.clone());
         }
-        let session = Arc::new(self.start_session(open).await?);
+        let wait = self.kv.options.wait_for_lease;
+        let session = Arc::new(self.start_session(open, wait).await?);
         *slot = Some(session.clone());
         Ok(session)
     }
@@ -780,7 +843,7 @@ impl Database {
         }
     }
 
-    async fn start_session(&self, open: &Arc<Open>) -> Result<Session> {
+    async fn start_session(&self, open: &Arc<Open>, wait_for_lease: bool) -> Result<Session> {
         {
             {
                 let Some((store, layout)) = self.kv.layout(&self.shared.name) else {
@@ -804,7 +867,7 @@ impl Database {
                             open.store.clone(),
                             open.clock.clone(),
                             self.kv.options.writer.clone(),
-                            self.kv.options.wait_for_lease,
+                            wait_for_lease,
                         )
                         .await?;
                         let empty = writer.position().await?.applied_lsn == 0;
@@ -1093,6 +1156,97 @@ impl Database {
             None => Ok(None),
             Some((store, layout)) => {
                 Ok(Some(valkvedge_sync::remote_head(&store, &layout).await?.1))
+            }
+        }
+    }
+
+    /// Who currently holds this database's lease, as recorded in the object
+    /// store: the owner's node id and the address it advertised. `None` when
+    /// nobody has ever owned it, when the last owner released it, or when
+    /// this client has no object store.
+    pub async fn owner(&self) -> Result<Option<Owner>> {
+        let Some((store, layout)) = self.kv.layout(&self.shared.name) else {
+            return Ok(None);
+        };
+        Ok(valkvedge_log::lease::read_lease(&store, &layout)
+            .await?
+            .filter(|lease| lease.state == valkvedge_log::LeaseState::Held)
+            .map(|lease| Owner {
+                node_id: lease.node_id,
+                node_addr: lease.node_addr,
+            }))
+    }
+
+    /// Becomes the writer of this database, waiting out a dead owner if
+    /// there is one.
+    ///
+    /// When another process holds the lease, this watches that process's
+    /// heartbeat for one lease TTL. If the heartbeat never changes, the owner
+    /// is dead and this process takes the database over. If the owner is
+    /// alive, this fails with `LEASE_HELD`. Unlike a write, the wait is not
+    /// cut short by `sync_write_timeout`.
+    ///
+    /// Use it when `wait_for_lease` is off and something outside the library
+    /// suggests the owner is gone, for example it cannot be reached.
+    pub async fn take_over(&self) -> Result<()> {
+        if self.kv.role() != Some(Role::Writer) {
+            return Err(ValkvEdgeError::ReadOnly(
+                "only a writer with an object store can take a database over".into(),
+            ));
+        }
+        let open = self.open()?;
+        let mut slot = open.session.lock().await;
+        if slot.is_none() {
+            *slot = Some(Arc::new(self.start_session(&open, true).await?));
+        }
+        Ok(())
+    }
+
+    /// Where this database lives in the object store, or `None` when this
+    /// client has no object store. See `docs/format.md` for what is under it.
+    pub fn object_prefix(&self) -> Option<String> {
+        self.kv
+            .layout(&self.shared.name)
+            .map(|(_, layout)| layout.prefix().to_string())
+    }
+
+    /// Applies outbox entries that another device made, as the writer.
+    ///
+    /// This is the receiving end of a push: each entry becomes one frame
+    /// holding the operations that won, by last write wins per key. Entries at
+    /// or below the device's watermark are reported as duplicates and not
+    /// applied again, so the sender can retry safely.
+    ///
+    /// Use it when this process is the writer and other devices hand it their
+    /// buffered writes over a channel of your own.
+    pub async fn accept_push(
+        &self,
+        device: DeviceId,
+        entries: Vec<OutboxEntry>,
+    ) -> Result<PushReport> {
+        let open = self.open()?;
+        let session = self.session_within_limit(&open).await?;
+        let Session::Writer(writer) = session.as_ref() else {
+            return Err(ValkvEdgeError::ReadOnly(
+                "only the writer of a database with an object store accepts pushes".into(),
+            ));
+        };
+        let limit = self.kv.options.sync_write_timeout;
+        let pushed = tokio::time::timeout(limit, writer.push(device, entries))
+            .await
+            .unwrap_or_else(|_| {
+                Err(ValkvEdgeError::Unavailable(format!(
+                    "the object store did not confirm the push within {limit:?}"
+                )))
+            });
+        match pushed {
+            Ok(report) => {
+                self.compact_if_due(&open, &session).await;
+                Ok(report)
+            }
+            Err(e) => {
+                self.reset_session(&open, &session).await;
+                Err(e)
             }
         }
     }

@@ -74,18 +74,43 @@ async fn data_survives_a_restart() {
 async fn limits_and_names_are_enforced() {
     let dir = tempfile::tempdir().unwrap();
     let kv = ValkvEdge::builder(dir.path()).build().unwrap();
-    for bad in [
+    let too_long = "x".repeat(65);
+    let bad_names = [
         "",
         "a",
         "Upper",
-        "1abc",
+        "-abc",
         "has space",
         "../escape",
-        &"x".repeat(49),
-    ] {
+        "a/b",
+        "ab/cd",
+        too_long.as_str(),
+    ];
+    for bad in bad_names {
         let err = kv.database(bad).open().await.err().expect(bad);
         assert_eq!(err.code(), "INVALID_NAME");
+        let err = kv
+            .namespace(bad)
+            .database("app")
+            .open()
+            .await
+            .err()
+            .expect(bad);
+        assert_eq!(err.code(), "INVALID_NAME");
+        let err = kv
+            .namespace("ns")
+            .database(bad)
+            .open()
+            .await
+            .err()
+            .expect(bad);
+        assert_eq!(err.code(), "INVALID_NAME");
     }
+    // Identifiers that start with a digit, such as UUIDs, are accepted.
+    kv.database("83ff1b56-8451-4cc4-b492-e90e1cc8798a")
+        .open()
+        .await
+        .unwrap();
     let db = kv.database("app").open().await.unwrap();
     let code = |r: valkvedge::Result<valkvedge::Commit>| r.unwrap_err().code();
     assert_eq!(code(db.put(b"", b"v").await), "KEY_TOO_LARGE");
@@ -113,6 +138,37 @@ async fn databases_are_isolated_from_each_other() {
     assert_eq!(pairs(b.range::<&str, _>(..).unwrap()).len(), 0);
     assert!(dir.path().join("tenant-a").is_dir());
     assert!(dir.path().join("tenant-b").is_dir());
+}
+
+#[tokio::test]
+async fn namespaces_keep_databases_with_the_same_name_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = ValkvEdge::builder(dir.path()).build().unwrap();
+    let a = kv
+        .namespace("team-a")
+        .database("settings")
+        .open()
+        .await
+        .unwrap();
+    let b = kv
+        .namespace("team-b")
+        .database("settings")
+        .open()
+        .await
+        .unwrap();
+    let plain = kv.database("settings").open().await.unwrap();
+
+    a.put(b"owner", b"a").await.unwrap();
+    b.put(b"owner", b"b").await.unwrap();
+    assert_eq!(a.get(b"owner").unwrap().unwrap(), b"a");
+    assert_eq!(b.get(b"owner").unwrap().unwrap(), b"b");
+    assert_eq!(plain.get(b"owner").unwrap(), None);
+    assert_eq!(a.name(), "team-a/settings");
+
+    assert!(dir.path().join("team-a").join("settings").is_dir());
+    assert!(dir.path().join("team-b").join("settings").is_dir());
+    assert!(dir.path().join("settings").is_dir());
+    assert_eq!(a.object_prefix(), None, "no object store configured");
 }
 
 #[tokio::test]
