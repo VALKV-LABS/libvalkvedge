@@ -35,6 +35,7 @@
 
 mod crypto;
 mod local;
+mod remote;
 
 use crypto::Cipher;
 use local::LocalStore;
@@ -160,6 +161,11 @@ enum Backend {
         prefix: String,
         role: Role,
     },
+    /// A service owns the databases; this process reaches them over HTTP.
+    Remote {
+        url: String,
+        api_key: String,
+    },
 }
 
 /// Configures and creates a [`ValkvEdge`].
@@ -167,6 +173,7 @@ pub struct Builder {
     root: PathBuf,
     options: Options,
     object: Option<(Store, String)>,
+    remote: Option<(String, String)>,
     role: Role,
 }
 
@@ -201,16 +208,34 @@ impl Builder {
         self
     }
 
+    /// Connects to a hosted service instead of an object store of your own.
+    ///
+    /// The device needs no storage credentials, only the service's URL and an
+    /// API key. Sync writes are confirmed by the service, buffered writes are
+    /// pushed to it, and the local copy follows it. Reads stay local.
+    /// Databases are addressed by the names they have in the service. See
+    /// `docs/hosted-api.md`.
+    pub fn remote(mut self, url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        self.remote = Some((url.into(), api_key.into()));
+        self
+    }
+
     /// Creates the client. Does not touch the network.
     pub fn build(self) -> Result<ValkvEdge> {
         std::fs::create_dir_all(&self.root).map_err(ValkvEdgeError::local)?;
-        let backend = match self.object {
-            None => Backend::Local,
-            Some((store, prefix)) => Backend::Object {
+        let backend = match (self.object, self.remote) {
+            (Some(_), Some(_)) => {
+                return Err(ValkvEdgeError::Unsupported(
+                    "choose either an object store or a hosted service, not both".into(),
+                ))
+            }
+            (None, None) => Backend::Local,
+            (Some((store, prefix)), None) => Backend::Object {
                 store,
                 prefix: prefix.trim_matches('/').to_string(),
                 role: self.role,
             },
+            (None, Some((url, api_key))) => Backend::Remote { url, api_key },
         };
         let inner = Arc::new(Inner {
             root: self.root,
@@ -224,13 +249,16 @@ impl Builder {
             node: tokio::sync::OnceCell::new(),
         });
         if inner.options.background {
-            if let (Backend::Object { role, .. }, Ok(handle)) =
-                (&inner.backend, tokio::runtime::Handle::try_current())
-            {
-                let tick = match role {
-                    Role::Writer => inner.options.push_interval,
-                    Role::Replica => inner.options.pull_interval,
-                };
+            let tick = match &inner.backend {
+                Backend::Local => None,
+                Backend::Object {
+                    role: Role::Writer, ..
+                } => Some(inner.options.push_interval),
+                Backend::Object { .. } | Backend::Remote { .. } => {
+                    Some(inner.options.pull_interval)
+                }
+            };
+            if let (Some(tick), Ok(handle)) = (tick, tokio::runtime::Handle::try_current()) {
                 let weak = Arc::downgrade(&inner);
                 handle.spawn(async move {
                     loop {
@@ -283,6 +311,7 @@ enum Session {
     Local,
     Replica,
     Writer(Box<Writer<LocalStore>>),
+    Remote(Box<remote::Client>),
 }
 
 impl Inner {
@@ -292,7 +321,7 @@ impl Inner {
 
     fn layout(&self, name: &str) -> Option<(Store, Layout)> {
         match &self.backend {
-            Backend::Local => None,
+            Backend::Local | Backend::Remote { .. } => None,
             Backend::Object { store, prefix, .. } => {
                 Some((store.clone(), Layout::new(format!("{prefix}/{name}"))))
             }
@@ -301,9 +330,13 @@ impl Inner {
 
     fn role(&self) -> Option<Role> {
         match &self.backend {
-            Backend::Local => None,
+            Backend::Local | Backend::Remote { .. } => None,
             Backend::Object { role, .. } => Some(*role),
         }
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self.backend, Backend::Remote { .. })
     }
 
     async fn node(&self, store: &Store) -> Result<Node> {
@@ -441,6 +474,12 @@ impl Inner {
                     db.flush().await.map(|_| ())
                 }
                 Some(Role::Replica) if shared.is_open() => db.sync().await.map(|_| ()),
+                // Hosted: push what is pending, and keep open copies fresh.
+                None if self.is_remote()
+                    && (shared.is_open() || shared.has_outbox.load(Ordering::Relaxed)) =>
+                {
+                    db.sync().await.map(|_| ())
+                }
                 _ => Ok(()),
             };
             if let Err(e) = result {
@@ -481,6 +520,7 @@ impl ValkvEdge {
             root: root.into(),
             options: Options::default(),
             object: None,
+            remote: None,
             role: Role::default(),
         }
     }
@@ -672,6 +712,12 @@ impl DatabaseBuilder {
                 {
                     open.store.set_encryption_check(&check)?;
                 }
+                // A device with no local copy of a hosted database downloads it.
+                let cold = pos == Default::default() || open.store.needs_bootstrap()?;
+                if db.kv.is_remote() && cold {
+                    drop(open);
+                    db.sync().await?;
+                }
             }
             Some(Role::Replica) => {
                 let cold = pos == Default::default() || open.store.needs_bootstrap()?;
@@ -846,6 +892,20 @@ impl Database {
     async fn start_session(&self, open: &Arc<Open>, wait_for_lease: bool) -> Result<Session> {
         {
             {
+                if let Backend::Remote { url, api_key } = &self.kv.backend {
+                    if self.shared.name.contains('/') {
+                        return Err(ValkvEdgeError::Unsupported(
+                            "namespaces are not available with a hosted service".into(),
+                        ));
+                    }
+                    let client = remote::Client::new(
+                        url,
+                        api_key,
+                        &self.shared.name,
+                        self.kv.options.sync_write_timeout,
+                    )?;
+                    return Ok(Session::Remote(Box::new(client)));
+                }
                 let Some((store, layout)) = self.kv.layout(&self.shared.name) else {
                     return Ok(Session::Local);
                 };
@@ -925,6 +985,20 @@ impl Database {
             ))
         };
         let session = self.session_within_limit(open).await?;
+        if let Session::Remote(client) = session.as_ref() {
+            // The service stores the write; the local copy then catches up to
+            // it, so a read right after this returns sees it.
+            let lsn = client.commit(&changes).await?;
+            while open.store.position()?.applied_lsn < lsn {
+                let reached = client.pull(open.store.as_ref()).await?;
+                if reached < lsn {
+                    return Err(unavailable(
+                        "the write was stored but could not be read back",
+                    ));
+                }
+            }
+            return Ok(lsn);
+        }
         let Session::Writer(writer) = session.as_ref() else {
             return Err(ValkvEdgeError::ReadOnly(
                 "this database has no writer".into(),
@@ -984,7 +1058,14 @@ impl Database {
         }
         let open = self.open()?;
 
-        match (self.kv.role(), durability) {
+        // From the caller's side a hosted database behaves like a writer's:
+        // sync writes are confirmed remotely, buffered writes go to the outbox.
+        let role = if self.kv.is_remote() {
+            Some(Role::Writer)
+        } else {
+            self.kv.role()
+        };
+        match (role, durability) {
             (Some(Role::Replica), _) => Err(ValkvEdgeError::ReadOnly(
                 "this process follows the database as a replica".into(),
             )),
@@ -1059,7 +1140,7 @@ impl Database {
     /// Operations that lost a conflict or were refused are reported through
     /// [`Database::take_events`].
     pub async fn flush(&self) -> Result<u64> {
-        if self.kv.role() != Some(Role::Writer) {
+        if self.kv.role() != Some(Role::Writer) && !self.kv.is_remote() {
             return Ok(0);
         }
         let _one_at_a_time = self.shared.flush_lock.lock().await;
@@ -1069,9 +1150,6 @@ impl Database {
             return Ok(0);
         }
         let session = self.session_within_limit(&open).await?;
-        let Session::Writer(writer) = session.as_ref() else {
-            return Ok(0);
-        };
         let mut settled = 0;
         loop {
             let entries = open.store.outbox_peek(self.kv.options.push_bytes)?;
@@ -1079,14 +1157,27 @@ impl Database {
                 break;
             }
             let limit = self.kv.options.sync_write_timeout;
-            let pushing = writer.push(open.clock.device(), entries.clone());
-            let pushed = tokio::time::timeout(limit, pushing)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(ValkvEdgeError::Unavailable(format!(
-                        "the object store did not confirm the push within {limit:?}"
-                    )))
-                });
+            let pushed = match session.as_ref() {
+                Session::Writer(writer) => {
+                    let pushing = writer.push(open.clock.device(), entries.clone());
+                    tokio::time::timeout(limit, pushing)
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(ValkvEdgeError::Unavailable(format!(
+                                "the object store did not confirm the push within {limit:?}"
+                            )))
+                        })
+                }
+                Session::Remote(client) => {
+                    match client.push(open.clock.device(), &entries).await {
+                        // The winners must be in the local copy before the
+                        // pending entries that hid them are removed.
+                        Ok(report) => client.pull(open.store.as_ref()).await.map(|_| report),
+                        Err(e) => Err(e),
+                    }
+                }
+                Session::Local | Session::Replica => return Ok(settled),
+            };
             let report = match pushed {
                 Ok(report) => report,
                 Err(e) => {
@@ -1138,6 +1229,10 @@ impl Database {
             Session::Writer(_) => {
                 self.flush().await?;
             }
+            Session::Remote(client) => {
+                self.flush().await?;
+                client.pull(open.store.as_ref()).await?;
+            }
             Session::Replica => {
                 let (store, layout) = self
                     .kv
@@ -1152,6 +1247,13 @@ impl Database {
     /// The newest LSN in the object store, without applying anything.
     /// `None` when this client has no object store.
     pub async fn remote_lsn(&self) -> Result<Option<Lsn>> {
+        if self.kv.is_remote() {
+            let open = self.open()?;
+            let session = self.session_within_limit(&open).await?;
+            if let Session::Remote(client) = session.as_ref() {
+                return client.head().await.map(Some);
+            }
+        }
         match self.kv.layout(&self.shared.name) {
             None => Ok(None),
             Some((store, layout)) => {

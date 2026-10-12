@@ -11,7 +11,7 @@ no AWS account. An S3 emulator (LocalStack) stands in for the object store.
 ## Run the automated tests
 
 ```sh
-make unit     # 78 tests, no services needed
+make unit     # 86 tests, no services needed
 make integ    # 3 tests against the S3 emulator
 make lint     # rustfmt and clippy
 make down     # stop the emulator when you are done
@@ -31,6 +31,7 @@ What the suites cover:
 | Embedded store | `crates/valkvedge/tests/local.rs` | The API, limits, isolation between databases, bounded open handles, encryption |
 | With an object store | `crates/valkvedge/tests/replicated.rs` | Writer and replica through the public API, buffered writes offline, takeover from a dead process |
 | Store outages | `crates/valkvedge/tests/unavailable.rs` | A sync write times out instead of hanging; reads and buffered writes carry on; the writer recovers by itself when the store returns |
+| Hosted client | `crates/valkvedge/tests/hosted.rs` | The same library against a service over HTTP: sync and buffered writes, conflicts, snapshot rebuilds, refusals, encryption |
 | S3 API | `crates/valkvedge/tests/s3.rs` | The same conditional writes, replication and fencing over real S3 requests |
 
 Run one test by name:
