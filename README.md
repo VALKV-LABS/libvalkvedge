@@ -118,7 +118,13 @@ db.sync().await?;                                 // pull what is new, any time
 | [`valkvedge-log`](crates/valkvedge-log) | The log format, conditional object-store access, leases and fencing. |
 | [`valkvedge-cli`](crates/valkvedge-cli) | Command-line inspector for a local database. |
 
-The object formats are specified in [docs/format.md](docs/format.md).
+## Documentation
+
+| | |
+|---|---|
+| [Architecture](docs/architecture.md) | The components, and how reads, writes, conflicts, ownership and replicas work |
+| [Testing locally](docs/testing-locally.md) | Run the tests, try every feature by hand against an S3 emulator, look inside the bucket |
+| [Object format](docs/format.md) | Exactly what is stored in the object store |
 
 ## Command line
 
@@ -140,8 +146,12 @@ Only Docker is needed. `make` lists the commands.
 make unit    # unit and in-process tests
 make integ   # the same behaviour against an S3 emulator
 make lint    # rustfmt and clippy
+make shell   # a shell wired to the emulator, for trying things by hand
+make bucket  # list what the emulator holds
 make down    # remove the emulator
 ```
+
+[docs/testing-locally.md](docs/testing-locally.md) walks through what to try.
 
 ## License
 

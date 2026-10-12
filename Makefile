@@ -4,7 +4,7 @@ RUN     = docker run --rm -v "$(CURDIR)":/src -w /src \
           -v vke-cargo:/usr/local/cargo/registry -v vke-target:/target \
           -e CARGO_TARGET_DIR=/target -e CARGO_TERM_COLOR=always $(IMAGE)
 
-.PHONY: help up unit integ lint fmt down cli-image
+.PHONY: help up unit integ lint fmt down cli-image shell bucket
 
 help: ## List the commands
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-10s %s\n", $$1, $$2}'
@@ -33,3 +33,11 @@ cli-image: ## Build the valkvedge-cli image
 
 down: ## Stop and remove the emulator and its data
 	docker compose down -v
+
+shell: ## A shell with the S3 emulator configured, for trying things by hand
+	@docker volume create vke-cargo >/dev/null && docker volume create vke-target >/dev/null
+	docker compose up -d --wait s3
+	docker compose run --rm tests bash
+
+bucket: ## List every object the emulator holds
+	docker compose exec s3 awslocal s3 ls --recursive s3://valkvedge-test

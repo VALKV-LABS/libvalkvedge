@@ -4,6 +4,9 @@ services:
     image: localstack/localstack:4
     environment:
       SERVICES: s3
+    # Reachable from the host for browsing with the AWS CLI or an S3 client.
+    ports:
+      - "127.0.0.1:${VALKVEDGE_S3_PORT:-4566}:4566"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
       interval: 2s
