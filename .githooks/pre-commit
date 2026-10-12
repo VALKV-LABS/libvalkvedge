@@ -1,0 +1,7 @@
+#!/bin/sh
+# This repository's hooks live in .githooks (see `make hooks`), which replaces
+# .git/hooks. Run a personal pre-commit hook from there too, if one exists.
+local_hook="$(git rev-parse --git-dir)/hooks/pre-commit"
+if [ -x "$local_hook" ]; then
+    exec "$local_hook" "$@"
+fi

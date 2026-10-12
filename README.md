@@ -153,6 +153,7 @@ make lint    # rustfmt and clippy
 make shell   # a shell wired to the emulator, for trying things by hand
 make bucket  # list what the emulator holds
 make down    # remove the emulator
+make hooks   # once per clone: run lint and the tests before every push
 ```
 
 [docs/testing-locally.md](docs/testing-locally.md) walks through what to try.

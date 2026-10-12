@@ -4,7 +4,7 @@ RUN     = docker run --rm -v "$(CURDIR)":/src -w /src \
           -v vke-cargo:/usr/local/cargo/registry -v vke-target:/target \
           -e CARGO_TARGET_DIR=/target -e CARGO_TERM_COLOR=always $(IMAGE)
 
-.PHONY: help up unit integ lint fmt down cli-image shell bucket
+.PHONY: help up unit integ lint fmt down cli-image shell bucket hooks
 
 help: ## List the commands
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-10s %s\n", $$1, $$2}'
@@ -41,3 +41,7 @@ shell: ## A shell with the S3 emulator configured, for trying things by hand
 
 bucket: ## List every object the emulator holds
 	docker compose exec s3 awslocal s3 ls --recursive s3://valkvedge-test
+
+hooks: ## Install the git hooks (run the checks before every push)
+	git config core.hooksPath .githooks
+	@echo "hooks installed: lint and tests now run before each push"
