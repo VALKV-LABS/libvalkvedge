@@ -122,7 +122,7 @@ db.sync().await?;                                 // pull what is new, any time
 
 | | |
 |---|---|
-| [Architecture](docs/architecture.md) | The components, and how reads, writes, conflicts, ownership and replicas work |
+| [Library components](docs/components.md) | The crates, and how reads, writes, conflicts, ownership and replicas work |
 | [Testing locally](docs/testing-locally.md) | Run the tests, try every feature by hand against an S3 emulator, look inside the bucket |
 | [Object format](docs/format.md) | Exactly what is stored in the object store |
 

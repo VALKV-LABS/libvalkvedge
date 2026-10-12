@@ -26,3 +26,5 @@ rustc-ice-*.txt
 # Local working notes, not published
 BUILD_MANIFEST.md
 AGENT_CONTEXT.md
+todo.md
+/spec.md

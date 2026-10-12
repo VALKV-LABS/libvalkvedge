@@ -1,6 +1,6 @@
-# Architecture
+# Library components
 
-How libvalkvedge is put together: the crates, what each one owns, and how a read, a
+How the library is put together: the crates, what each one owns, and how a read, a
 write and a failover move through them.
 
 For the bytes that end up in the object store, see [format.md](format.md). To run any
