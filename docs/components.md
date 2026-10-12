@@ -254,7 +254,12 @@ slightly behind, then deleted.
 
 ## Many databases in one process
 
-Each database is its own Fjall database in its own directory. The manager keeps at most
+Each database is its own Fjall database in its own directory. Databases can be grouped
+into namespaces (`kv.namespace("acme").database("orders")`): a namespace is a
+subdirectory locally and a sub-prefix in the object store, so a group can be listed or
+removed as a unit, and two namespaces can each have a database of the same name.
+
+The manager keeps at most
 `max_open_databases` of them open.
 
 - Opening one more when the limit is reached closes the least recently used database

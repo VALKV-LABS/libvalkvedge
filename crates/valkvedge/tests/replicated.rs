@@ -206,6 +206,123 @@ async fn pending_buffered_writes_overlay_replicated_data_in_reads_and_scans() {
 }
 
 #[tokio::test]
+async fn namespaced_databases_have_their_own_prefix_and_replicate() {
+    use futures::TryStreamExt;
+    let store = Arc::new(InMemory::new());
+    let (wdir, rdir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let writer = client(&wdir, &store, Role::Writer);
+    let a = writer
+        .namespace("acme")
+        .database("orders")
+        .open()
+        .await
+        .unwrap();
+    let b = writer
+        .namespace("globex")
+        .database("orders")
+        .open()
+        .await
+        .unwrap();
+    a.put(b"k", b"acme").await.unwrap();
+    b.put(b"k", b"globex").await.unwrap();
+    assert_eq!(a.object_prefix().as_deref(), Some("tenant/acme/orders"));
+
+    let keys: Vec<String> = store
+        .list(None)
+        .map_ok(|m| m.location.to_string())
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(keys
+        .iter()
+        .any(|k| k.starts_with("tenant/acme/orders/gen/")));
+    assert!(keys
+        .iter()
+        .any(|k| k.starts_with("tenant/globex/orders/gen/")));
+    assert!(keys.iter().all(|k| k.starts_with("tenant/acme/")
+        || k.starts_with("tenant/globex/")
+        || k.starts_with("_nodes/")));
+
+    let replica = client(&rdir, &store, Role::Replica);
+    let follower = replica
+        .namespace("globex")
+        .database("orders")
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(text(follower.get(b"k").unwrap()).as_deref(), Some("globex"));
+}
+
+#[tokio::test]
+async fn the_writer_accepts_pushed_entries_from_other_devices() {
+    use valkvedge::{DeviceId, Hlc, Op, OpKind, OpOutcome, OutboxEntry};
+    let store = Arc::new(InMemory::new());
+    let (wdir, rdir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let db = client(&wdir, &store, Role::Writer)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    db.put(b"title", b"from-writer").await.unwrap();
+
+    let phone = DeviceId([7; 16]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let op = |key: &str, value: &str, ms: u64| Op {
+        kind: OpKind::Put,
+        key: key.as_bytes().to_vec(),
+        value: value.as_bytes().to_vec(),
+        hlc: Hlc {
+            physical_ms: ms,
+            counter: 0,
+            device: phone,
+        },
+    };
+    let entries = vec![OutboxEntry {
+        seq: 1,
+        ops: vec![
+            op("title", "stale-from-phone", now - 60_000),
+            op("note", "from-phone", now - 60_000),
+        ],
+    }];
+
+    let report = db.accept_push(phone, entries.clone()).await.unwrap();
+    assert_eq!(
+        report.entries,
+        vec![(1, vec![OpOutcome::Superseded, OpOutcome::Applied])]
+    );
+    assert_eq!(report.watermark, 1);
+    assert_eq!(
+        text(db.get(b"title").unwrap()).as_deref(),
+        Some("from-writer")
+    );
+    assert_eq!(
+        text(db.get(b"note").unwrap()).as_deref(),
+        Some("from-phone")
+    );
+
+    // The phone retries the same push: nothing is applied twice.
+    let retry = db.accept_push(phone, entries).await.unwrap();
+    assert_eq!(retry.entries[0].1, vec![OpOutcome::Duplicate; 2]);
+    assert_eq!(retry.lsn, report.lsn);
+
+    // A replica cannot accept pushes.
+    let follower = client(&rdir, &store, Role::Replica)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(
+        text(follower.get(b"note").unwrap()).as_deref(),
+        Some("from-phone")
+    );
+    let err = follower.accept_push(phone, Vec::new()).await.unwrap_err();
+    assert_eq!(err.code(), "READ_ONLY");
+}
+
+#[tokio::test]
 async fn a_buffered_write_made_after_a_sync_write_always_wins() {
     // Many rounds in quick succession, so writes land in the same millisecond.
     let store = Arc::new(InMemory::new());

@@ -44,12 +44,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use valkvedge_log::{HlcClock, Layout, Node, Op, Store};
-use valkvedge_sync::{Change, OpOutcome, StateStore, Writer};
+use valkvedge_log::{HlcClock, Layout, Node, Store};
+use valkvedge_sync::{Change, StateStore, Writer};
 
 pub use local::Iter;
+pub use valkvedge_log::{DeviceId, Hlc, Op};
 pub use valkvedge_log::{Error as ValkvEdgeError, LeaseConfig, Lsn, OpKind, RejectReason, Result};
-pub use valkvedge_sync::WriterConfig;
+pub use valkvedge_sync::{OpOutcome, OutboxEntry, PushReport, WriterConfig};
 
 /// Re-export of the object store crate, for building a store to pass to
 /// [`Builder::object_store`].
@@ -474,14 +475,29 @@ impl ValkvEdge {
 
     /// Starts opening the database called `name`.
     ///
-    /// Names are 2 to 48 characters: lowercase letters, digits and `-`,
-    /// starting with a letter.
+    /// Names are 2 to 64 characters: lowercase letters, digits and `-`,
+    /// starting with a letter or digit.
     pub fn database(&self, name: &str) -> DatabaseBuilder {
         DatabaseBuilder {
             kv: self.inner.clone(),
-            name: name.to_string(),
+            // A slash is only valid through `namespace`.
+            name: name.replace('/', "\0"),
             durability: Durability::default(),
             key: None,
+        }
+    }
+
+    /// A group of databases kept under their own directory locally and their
+    /// own prefix in the object store.
+    ///
+    /// Databases in different namespaces are unrelated even when they share a
+    /// name. Use it to keep one application's or one customer's databases
+    /// together, for example to delete them as a unit. Namespace names follow
+    /// the same rules as database names.
+    pub fn namespace(&self, namespace: &str) -> Namespace {
+        Namespace {
+            kv: self.inner.clone(),
+            namespace: namespace.replace('/', "\0"),
         }
     }
 
@@ -525,13 +541,38 @@ impl ValkvEdge {
     }
 }
 
-fn valid_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    (2..=48).contains(&bytes.len())
-        && bytes[0].is_ascii_lowercase()
+fn valid_part(part: &str) -> bool {
+    let bytes = part.as_bytes();
+    (2..=64).contains(&bytes.len())
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
         && bytes
             .iter()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// A database is identified by `name` or `namespace/name`.
+fn valid_name(name: &str) -> bool {
+    let mut parts = name.split('/');
+    let (first, second, third) = (parts.next(), parts.next(), parts.next());
+    third.is_none() && first.is_some_and(valid_part) && second.is_none_or(valid_part)
+}
+
+/// A group of databases. See [`ValkvEdge::namespace`].
+pub struct Namespace {
+    kv: Arc<Inner>,
+    namespace: String,
+}
+
+impl Namespace {
+    /// Starts opening the database called `name` in this namespace.
+    pub fn database(&self, name: &str) -> DatabaseBuilder {
+        DatabaseBuilder {
+            kv: self.kv.clone(),
+            name: format!("{}/{}", self.namespace, name.replace('/', "\0")),
+            durability: Durability::default(),
+            key: None,
+        }
+    }
 }
 
 /// Options for opening one database.
@@ -1093,6 +1134,55 @@ impl Database {
             None => Ok(None),
             Some((store, layout)) => {
                 Ok(Some(valkvedge_sync::remote_head(&store, &layout).await?.1))
+            }
+        }
+    }
+
+    /// Where this database lives in the object store, or `None` when this
+    /// client has no object store. See `docs/format.md` for what is under it.
+    pub fn object_prefix(&self) -> Option<String> {
+        self.kv
+            .layout(&self.shared.name)
+            .map(|(_, layout)| layout.prefix().to_string())
+    }
+
+    /// Applies outbox entries that another device made, as the writer.
+    ///
+    /// This is the receiving end of a push: each entry becomes one frame
+    /// holding the operations that won, by last write wins per key. Entries at
+    /// or below the device's watermark are reported as duplicates and not
+    /// applied again, so the sender can retry safely.
+    ///
+    /// Use it when this process is the writer and other devices hand it their
+    /// buffered writes over a channel of your own.
+    pub async fn accept_push(
+        &self,
+        device: DeviceId,
+        entries: Vec<OutboxEntry>,
+    ) -> Result<PushReport> {
+        let open = self.open()?;
+        let session = self.session_within_limit(&open).await?;
+        let Session::Writer(writer) = session.as_ref() else {
+            return Err(ValkvEdgeError::ReadOnly(
+                "only the writer of a database with an object store accepts pushes".into(),
+            ));
+        };
+        let limit = self.kv.options.sync_write_timeout;
+        let pushed = tokio::time::timeout(limit, writer.push(device, entries))
+            .await
+            .unwrap_or_else(|_| {
+                Err(ValkvEdgeError::Unavailable(format!(
+                    "the object store did not confirm the push within {limit:?}"
+                )))
+            });
+        match pushed {
+            Ok(report) => {
+                self.compact_if_due(&open, &session).await;
+                Ok(report)
+            }
+            Err(e) => {
+                self.reset_session(&open, &session).await;
+                Err(e)
             }
         }
     }

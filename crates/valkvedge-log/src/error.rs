@@ -52,7 +52,8 @@ pub enum Error {
     /// The database was opened read-only, or the handle cannot write.
     #[error("database is read-only: {0}")]
     ReadOnly(String),
-    /// A database name does not match `^[a-z][a-z0-9-]{1,47}$`.
+    /// A database or namespace name is not 2 to 64 characters of lowercase
+    /// letters, digits and `-`, starting with a letter or digit.
     #[error("invalid database name: {0:?}")]
     InvalidName(String),
     /// A key is empty or longer than the limit.
