@@ -265,7 +265,9 @@ struct Shared {
 
 struct Open {
     store: Arc<LocalStore>,
-    clock: HlcClock,
+    // One clock per database, shared with the writer, so a buffered write
+    // made after a sync write is always stamped later.
+    clock: Arc<HlcClock>,
     // Replaced after a failed write, so the next one starts from the log.
     session: tokio::sync::Mutex<Option<Arc<Session>>>,
 }
@@ -335,7 +337,7 @@ impl Inner {
             .has_outbox
             .store(store.outbox_stat()?.entries > 0, Ordering::Relaxed);
         let open = Arc::new(Open {
-            clock: HlcClock::new(store.device_id()?),
+            clock: Arc::new(HlcClock::new(store.device_id()?)),
             store,
             session: tokio::sync::Mutex::new(None),
         });
@@ -800,7 +802,7 @@ impl Database {
                             layout,
                             node,
                             open.store.clone(),
-                            open.clock.device(),
+                            open.clock.clone(),
                             self.kv.options.writer.clone(),
                             self.kv.options.wait_for_lease,
                         )
@@ -925,6 +927,14 @@ impl Database {
             )),
             (Some(Role::Writer), Durability::Buffered) => {
                 // No network and no session: this path must work offline.
+                // A write made now is later than whatever this device already
+                // holds for the key, even if that was stamped by another
+                // process or by a clock slightly ahead of this one.
+                for change in &changes {
+                    if let Some(current) = open.store.version_of(&change.key)? {
+                        open.clock.observe(&current);
+                    }
+                }
                 let ops: Vec<Op> = changes
                     .into_iter()
                     .map(|c| Op {

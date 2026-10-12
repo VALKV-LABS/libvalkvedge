@@ -88,7 +88,7 @@ pub struct Writer<S: StateStore> {
     store: Store,
     layout: Layout,
     state: Arc<S>,
-    clock: HlcClock,
+    clock: Arc<HlcClock>,
     config: WriterConfig,
     log: Mutex<Option<LogWriter>>,
 }
@@ -112,7 +112,7 @@ impl<S: StateStore> Writer<S> {
         layout: Layout,
         node: Node,
         state: Arc<S>,
-        device: DeviceId,
+        clock: Arc<HlcClock>,
         config: WriterConfig,
         wait: bool,
     ) -> Result<Self> {
@@ -124,7 +124,6 @@ impl<S: StateStore> Writer<S> {
                 "state did not reach the log tail: {have:?} vs {want:?}"
             )));
         }
-        let clock = HlcClock::new(device);
         Ok(Writer {
             store,
             layout,

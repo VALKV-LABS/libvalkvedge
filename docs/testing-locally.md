@@ -11,7 +11,7 @@ no AWS account. An S3 emulator (LocalStack) stands in for the object store.
 ## Run the automated tests
 
 ```sh
-make unit     # 71 tests, no services needed
+make unit     # 73 tests, no services needed
 make integ    # 3 tests against the S3 emulator
 make lint     # rustfmt and clippy
 make down     # stop the emulator when you are done

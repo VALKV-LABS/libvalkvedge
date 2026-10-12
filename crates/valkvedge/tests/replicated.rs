@@ -206,6 +206,57 @@ async fn pending_buffered_writes_overlay_replicated_data_in_reads_and_scans() {
 }
 
 #[tokio::test]
+async fn a_buffered_write_made_after_a_sync_write_always_wins() {
+    // Many rounds in quick succession, so writes land in the same millisecond.
+    let store = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let db = client(&dir, &store, Role::Writer)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    for round in 0..200u32 {
+        let (first, second) = (format!("sync-{round}"), format!("buffered-{round}"));
+        db.put(b"k", first.as_bytes()).await.unwrap();
+        let mut batch = db.batch();
+        batch.put(b"k", second.as_bytes());
+        batch.commit_with(Durability::Buffered).await.unwrap();
+        db.flush().await.unwrap();
+        assert_eq!(text(db.get(b"k").unwrap()), Some(second), "round {round}");
+    }
+    assert!(db.take_events().is_empty(), "no later write was superseded");
+}
+
+#[tokio::test]
+async fn a_buffered_write_beats_a_newer_looking_value_this_device_already_holds() {
+    // The writer process restarts between the two writes, so each is stamped
+    // by a fresh clock. The second must still be the later one.
+    let store = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    for round in 0..20u32 {
+        let kv = client(&dir, &store, Role::Writer);
+        let db = kv.database("app").open().await.unwrap();
+        db.put(b"k", b"sync").await.unwrap();
+        kv.close().await.unwrap();
+        drop((db, kv));
+
+        let kv = client(&dir, &store, Role::Writer);
+        let db = kv.database("app").open().await.unwrap();
+        let mut batch = db.batch();
+        batch.put(b"k", b"buffered");
+        batch.commit_with(Durability::Buffered).await.unwrap();
+        db.flush().await.unwrap();
+        assert_eq!(
+            text(db.get(b"k").unwrap()).as_deref(),
+            Some("buffered"),
+            "round {round}"
+        );
+        assert!(db.take_events().is_empty());
+        kv.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn a_buffered_write_that_loses_a_conflict_is_reported() {
     let store = Arc::new(InMemory::new());
     let dir = tempfile::tempdir().unwrap();

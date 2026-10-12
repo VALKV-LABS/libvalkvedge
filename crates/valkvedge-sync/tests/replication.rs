@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use valkvedge_log::{
-    now_ms, DeviceId, Hlc, Layout, LeaseConfig, Node, Op, OpKind, RejectReason, Store,
+    now_ms, DeviceId, Hlc, HlcClock, Layout, LeaseConfig, Node, Op, OpKind, RejectReason, Store,
 };
 use valkvedge_sync::{
     pull, remote_head, Change, MemState, OpOutcome, OutboxEntry, StateStore, Writer, WriterConfig,
@@ -41,7 +41,7 @@ async fn writer_with(
         Layout::new("db"),
         node,
         state,
-        DeviceId::random(),
+        Arc::new(HlcClock::new(DeviceId::random())),
         config,
         wait,
     )
@@ -417,7 +417,7 @@ async fn no_acknowledged_write_is_lost_when_the_owner_dies() {
         layout.clone(),
         node_a.clone(),
         Arc::new(MemState::new()),
-        DeviceId::random(),
+        Arc::new(HlcClock::new(DeviceId::random())),
         WriterConfig::default(),
         false,
     )
