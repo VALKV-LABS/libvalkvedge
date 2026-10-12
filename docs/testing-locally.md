@@ -11,7 +11,7 @@ no AWS account. An S3 emulator (LocalStack) stands in for the object store.
 ## Run the automated tests
 
 ```sh
-make unit     # 68 tests, no services needed
+make unit     # 71 tests, no services needed
 make integ    # 3 tests against the S3 emulator
 make lint     # rustfmt and clippy
 make down     # stop the emulator when you are done
@@ -30,6 +30,7 @@ What the suites cover:
 | Replication | `crates/valkvedge-sync/tests/replication.rs` | Replicas follow, cold boot from a snapshot, survive an interrupted load; conflicts resolve by last write wins; retried pushes are not applied twice across a failover |
 | Embedded store | `crates/valkvedge/tests/local.rs` | The API, limits, isolation between databases, bounded open handles, encryption |
 | With an object store | `crates/valkvedge/tests/replicated.rs` | Writer and replica through the public API, buffered writes offline, takeover from a dead process |
+| Store outages | `crates/valkvedge/tests/unavailable.rs` | A sync write times out instead of hanging; reads and buffered writes carry on; the writer recovers by itself when the store returns |
 | S3 API | `crates/valkvedge/tests/s3.rs` | The same conditional writes, replication and fencing over real S3 requests |
 
 Run one test by name:
@@ -141,8 +142,14 @@ Back in the shell:
 ```sh
 kv /tmp/a writer notes put-buffered offline yes   # returns immediately
 kv /tmp/a writer notes scan                       # reads still work
-kv /tmp/a writer notes put needs-network 1        # hangs: a sync write needs the store. Ctrl-C.
+kv /tmp/a writer notes put needs-network 1        # fails after about 10 seconds:
+                                                  # error: object store unavailable: could not
+                                                  # reach the object store within 10s
+kv /tmp/a writer notes get greeting               # still answers at once
 ```
+
+A sync write has to reach the object store, so it waits, but only up to
+`sync_write_timeout` (10 seconds by default). Nothing local waits on the store.
 
 Then `docker compose unpause s3` and:
 

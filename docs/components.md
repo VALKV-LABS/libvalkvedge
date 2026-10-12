@@ -151,6 +151,25 @@ Two properties to notice:
 - **A buffered write needs no network at all.** It does not even take the lease. The
   lease is taken when the outbox is pushed.
 
+### When the object store is unreachable
+
+Only three things wait on the object store: a sync write, a push of the outbox, and a
+replica's pull. Each sync write and each push is bounded by `sync_write_timeout`
+(10 seconds by default) and then fails with `UNAVAILABLE`. Reads, scans and buffered
+writes are local and are not affected.
+
+A write that timed out or failed leaves the writer unsure of where the log ends: the
+store may have accepted the segment without the answer arriving. So the writer session
+is thrown away. The next write opens a new one, which takes the lease again, re-reads
+the tail of the log, and applies anything it finds there to the local store before
+continuing. The application does nothing: the same `Database` handle keeps working once
+the store is back. The outbox is untouched by a failed push and is sent again; the
+watermark makes the retry safe.
+
+Opening a session can take longer than one write is willing to wait, for example while
+watching a dead owner's lease expire. That work is not cancelled when a write gives up.
+It continues in the background, and a later write finds the session ready.
+
 ### Conflicts
 
 Every operation carries a hybrid logical clock timestamp: wall-clock milliseconds, a

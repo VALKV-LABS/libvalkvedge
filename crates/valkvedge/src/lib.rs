@@ -118,6 +118,10 @@ pub struct Options {
     /// Run the background task that pushes outboxes, pulls replicas and
     /// closes idle databases.
     pub background: bool,
+    /// Longest a sync write waits. After this it fails with `UNAVAILABLE`; the
+    /// write may or may not have been stored. Reads and buffered writes never
+    /// wait on the object store.
+    pub sync_write_timeout: Duration,
 }
 
 impl Default for Options {
@@ -137,6 +141,7 @@ impl Default for Options {
             writer: WriterConfig::default(),
             node_id: None,
             background: true,
+            sync_write_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -261,7 +266,8 @@ struct Shared {
 struct Open {
     store: Arc<LocalStore>,
     clock: HlcClock,
-    session: tokio::sync::OnceCell<Session>,
+    // Replaced after a failed write, so the next one starts from the log.
+    session: tokio::sync::Mutex<Option<Arc<Session>>>,
 }
 
 enum Session {
@@ -331,7 +337,7 @@ impl Inner {
         let open = Arc::new(Open {
             clock: HlcClock::new(store.device_id()?),
             store,
-            session: tokio::sync::OnceCell::new(),
+            session: tokio::sync::Mutex::new(None),
         });
         *shared.slot.lock().expect("slot lock") = Some(open.clone());
         self.open_count.fetch_add(1, Ordering::SeqCst);
@@ -503,7 +509,8 @@ impl ValkvEdge {
         for shared in all {
             let open = shared.slot.lock().expect("slot lock").clone();
             if let Some(open) = open {
-                if let Some(Session::Writer(writer)) = open.session.get() {
+                let session = open.session.lock().await.clone();
+                if let Some(Session::Writer(writer)) = session.as_deref() {
                     if let Err(e) = writer.release().await {
                         first_error.get_or_insert(e);
                     }
@@ -749,9 +756,31 @@ impl Database {
         }
     }
 
-    async fn session<'a>(&self, open: &'a Arc<Open>) -> Result<&'a Session> {
-        open.session
-            .get_or_try_init(|| async {
+    /// The database's session, created on first use and again after
+    /// [`Database::reset_session`].
+    async fn session(&self, open: &Arc<Open>) -> Result<Arc<Session>> {
+        let mut slot = open.session.lock().await;
+        if let Some(session) = slot.as_ref() {
+            return Ok(session.clone());
+        }
+        let session = Arc::new(self.start_session(open).await?);
+        *slot = Some(session.clone());
+        Ok(session)
+    }
+
+    /// Forgets a session whose writer can no longer be trusted. The next
+    /// operation opens a new one, which re-reads the tail of the log and so
+    /// learns whether an unfinished write was stored.
+    async fn reset_session(&self, open: &Arc<Open>, broken: &Arc<Session>) {
+        let mut slot = open.session.lock().await;
+        if matches!(slot.as_ref(), Some(current) if Arc::ptr_eq(current, broken)) {
+            *slot = None;
+        }
+    }
+
+    async fn start_session(&self, open: &Arc<Open>) -> Result<Session> {
+        {
+            {
                 let Some((store, layout)) = self.kv.layout(&self.shared.name) else {
                     return Ok(Session::Local);
                 };
@@ -790,8 +819,71 @@ impl Database {
                     open.store.set_encryption_check(&cipher.make_check()?)?;
                 }
                 Ok(session)
-            })
-            .await
+            }
+        }
+    }
+
+    /// The session, waiting at most `sync_write_timeout` for it.
+    ///
+    /// Taking ownership can legitimately take longer than one call is willing
+    /// to wait (watching a dead owner's lease expire). So it runs detached:
+    /// this call gives up at the limit, the attempt carries on, and a later
+    /// call finds the session ready.
+    async fn session_within_limit(&self, open: &Arc<Open>) -> Result<Arc<Session>> {
+        let limit = self.kv.options.sync_write_timeout;
+        let cap = self.kv.options.lease.lease_ttl + limit * 2;
+        let (db, held) = (self.clone(), open.clone());
+        let opening = tokio::spawn(async move {
+            match tokio::time::timeout(cap, db.session(&held)).await {
+                Ok(result) => result,
+                Err(_) => Err(ValkvEdgeError::Unavailable(
+                    "could not open the database in the object store".into(),
+                )),
+            }
+        });
+        match tokio::time::timeout(limit, opening).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(join)) => Err(ValkvEdgeError::local(join)),
+            Err(_) => Err(ValkvEdgeError::Unavailable(format!(
+                "could not reach the object store within {limit:?}"
+            ))),
+        }
+    }
+
+    /// A sync write through the writer, bounded by `sync_write_timeout`.
+    async fn commit_sync(&self, open: &Arc<Open>, changes: Vec<Change>) -> Result<Lsn> {
+        let limit = self.kv.options.sync_write_timeout;
+        let started = Instant::now();
+        let unavailable = |what: &str| {
+            ValkvEdgeError::Unavailable(format!(
+                "{what} within {limit:?}; the write may or may not have been stored"
+            ))
+        };
+        let session = self.session_within_limit(open).await?;
+        let Session::Writer(writer) = session.as_ref() else {
+            return Err(ValkvEdgeError::ReadOnly(
+                "this database has no writer".into(),
+            ));
+        };
+
+        // The commit itself is cancelled at the limit. A cancelled or failed
+        // commit leaves the writer in an unknown position, so the session is
+        // dropped and the next write starts from what the log really holds.
+        let remaining = limit.saturating_sub(started.elapsed());
+        let result = match tokio::time::timeout(remaining, writer.commit(changes)).await {
+            Ok(result) => result,
+            Err(_) => Err(unavailable("the object store did not confirm the write")),
+        };
+        match result {
+            Ok(lsn) => {
+                self.compact_if_due(open, &session).await;
+                Ok(lsn)
+            }
+            Err(e) => {
+                self.reset_session(open, &session).await;
+                Err(e)
+            }
+        }
     }
 
     async fn write(&self, mut changes: Vec<Change>, durability: Durability) -> Result<Commit> {
@@ -859,31 +951,32 @@ impl Database {
                     outbox_seq: Some(seq),
                 })
             }
-            _ => match self.session(&open).await? {
-                Session::Local => {
-                    let lsn = open.store.apply_local(changes, || open.clock.now())?;
-                    Ok(Commit {
-                        lsn: Some(lsn),
-                        outbox_seq: None,
-                    })
-                }
-                Session::Writer(writer) => {
-                    let lsn = writer.commit(changes).await?;
-                    self.compact_if_due(writer).await;
-                    Ok(Commit {
-                        lsn: Some(lsn),
-                        outbox_seq: None,
-                    })
-                }
-                Session::Replica => unreachable!("replica writes are refused above"),
-            },
+            (None, _) => {
+                // No object store: the local store is the database.
+                let lsn = open.store.apply_local(changes, || open.clock.now())?;
+                Ok(Commit {
+                    lsn: Some(lsn),
+                    outbox_seq: None,
+                })
+            }
+            (Some(Role::Writer), Durability::Sync) => {
+                let lsn = self.commit_sync(&open, changes).await?;
+                Ok(Commit {
+                    lsn: Some(lsn),
+                    outbox_seq: None,
+                })
+            }
         }
     }
 
-    async fn compact_if_due(&self, writer: &Writer<LocalStore>) {
+    async fn compact_if_due(&self, open: &Arc<Open>, session: &Arc<Session>) {
+        let Session::Writer(writer) = session.as_ref() else {
+            return;
+        };
         if writer.should_compact().await {
             if let Err(e) = writer.compact().await {
                 tracing::warn!(database = %self.shared.name, error = %e, "compaction failed");
+                self.reset_session(open, session).await;
             }
         }
     }
@@ -902,7 +995,8 @@ impl Database {
             self.shared.has_outbox.store(false, Ordering::Relaxed);
             return Ok(0);
         }
-        let Session::Writer(writer) = self.session(&open).await? else {
+        let session = self.session_within_limit(&open).await?;
+        let Session::Writer(writer) = session.as_ref() else {
             return Ok(0);
         };
         let mut settled = 0;
@@ -911,7 +1005,24 @@ impl Database {
             if entries.is_empty() {
                 break;
             }
-            let report = writer.push(open.clock.device(), entries.clone()).await?;
+            let limit = self.kv.options.sync_write_timeout;
+            let pushing = writer.push(open.clock.device(), entries.clone());
+            let pushed = tokio::time::timeout(limit, pushing)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ValkvEdgeError::Unavailable(format!(
+                        "the object store did not confirm the push within {limit:?}"
+                    )))
+                });
+            let report = match pushed {
+                Ok(report) => report,
+                Err(e) => {
+                    // The entries stay in the outbox. A retried push is safe:
+                    // the writer skips whatever was already applied.
+                    self.reset_session(&open, &session).await;
+                    return Err(e);
+                }
+            };
             {
                 let mut events = self.shared.events.lock().expect("events lock");
                 for (entry, (_, outcomes)) in entries.iter().zip(&report.entries) {
@@ -938,7 +1049,7 @@ impl Database {
                 .has_outbox
                 .store(stat.entries > 0, Ordering::Relaxed);
         }
-        self.compact_if_due(writer).await;
+        self.compact_if_due(&open, &session).await;
         Ok(settled)
     }
 
@@ -948,7 +1059,8 @@ impl Database {
     /// snapshot if it is too far behind.
     pub async fn sync(&self) -> Result<Lsn> {
         let open = self.open()?;
-        match self.session(&open).await? {
+        let session = self.session_within_limit(&open).await?;
+        match session.as_ref() {
             Session::Local => {}
             Session::Writer(_) => {
                 self.flush().await?;
@@ -978,8 +1090,15 @@ impl Database {
     /// Writes a snapshot and starts a new generation now. Writer only.
     pub async fn compact(&self) -> Result<()> {
         let open = self.open()?;
-        match self.session(&open).await? {
-            Session::Writer(writer) => writer.compact().await.map(|_| ()),
+        let session = self.session_within_limit(&open).await?;
+        match session.as_ref() {
+            Session::Writer(writer) => match writer.compact().await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    self.reset_session(&open, &session).await;
+                    Err(e)
+                }
+            },
             _ => Err(ValkvEdgeError::ReadOnly(
                 "only the writer of a database with an object store can compact".into(),
             )),

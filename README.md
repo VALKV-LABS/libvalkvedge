@@ -97,6 +97,10 @@ db.sync().await?;                                 // pull what is new, any time
 - **Buffered writes can lose a conflict.** Conflicts are resolved per key by timestamp,
   last write wins. A buffered write that loses is reported through
   `Database::take_events`; it is not applied and not silently dropped.
+- **A sync write needs the object store, and gives up after 10 seconds** (set
+  `Options::sync_write_timeout`). It then fails with `UNAVAILABLE`. Reads and buffered
+  writes never wait on the object store, so they keep working while it is unreachable.
+  When it comes back, the same handles work again without reopening anything.
 - **A failed sync write may still have been stored.** If the object store accepts a
   write but the response is lost, the caller gets an error and the write is durable.
   Make sync writes safe to repeat.

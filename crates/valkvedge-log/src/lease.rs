@@ -151,7 +151,13 @@ impl Node {
                 if stopped.load(Ordering::SeqCst) {
                     break;
                 }
-                if let Err(e) = runtime.block_on(renew.beat()) {
+                // Bounded, so a store that never answers cannot wedge this thread.
+                let limit = renew.config.lease_ttl;
+                let beat =
+                    runtime.block_on(async { tokio::time::timeout(limit, renew.beat()).await });
+                let beat =
+                    beat.unwrap_or_else(|_| Err(Error::Unavailable("heartbeat timed out".into())));
+                if let Err(e) = beat {
                     tracing::warn!(node = %renew.node_id, error = %e, "heartbeat renewal failed");
                 }
             })
