@@ -205,6 +205,99 @@ async fn pending_buffered_writes_overlay_replicated_data_in_reads_and_scans() {
     assert_eq!(db.range::<&str, _>(..).unwrap().count(), 3);
 }
 
+fn writer_at(dir: &tempfile::TempDir, store: &Arc<InMemory>, id: &str, addr: &str) -> ValkvEdge {
+    ValkvEdge::builder(dir.path())
+        .options(Options {
+            node_id: Some(id.to_string()),
+            node_addr: addr.to_string(),
+            // Do not wait when someone else owns a database: fail at once.
+            wait_for_lease: false,
+            ..options()
+        })
+        .object_store(store.clone(), "tenant")
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_owner_and_its_address_are_visible_and_a_live_owner_is_not_displaced() {
+    let store = Arc::new(InMemory::new());
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = writer_at(&dir_a, &store, "node-a", "10.0.0.1:7000");
+    let b = writer_at(&dir_b, &store, "node-b", "10.0.0.2:7000");
+    let on_a = a.database("app").open().await.unwrap();
+    let on_b = b.database("app").open().await.unwrap();
+    assert_eq!(on_b.owner().await.unwrap(), None, "nobody owns it yet");
+
+    on_a.put(b"k", b"1").await.unwrap();
+    let owner = on_b.owner().await.unwrap().unwrap();
+    assert_eq!(
+        (owner.node_id.as_str(), owner.node_addr.as_str()),
+        ("node-a", "10.0.0.1:7000")
+    );
+
+    // b is told at once, and even an explicit take-over is refused while a lives.
+    assert_eq!(on_b.put(b"k", b"2").await.unwrap_err().code(), "LEASE_HELD");
+    assert_eq!(on_b.take_over().await.unwrap_err().code(), "LEASE_HELD");
+    assert_eq!(text(on_a.get(b"k").unwrap()).as_deref(), Some("1"));
+
+    // After a clean close the lease is released: nobody owns it.
+    a.close().await.unwrap();
+    assert_eq!(on_b.owner().await.unwrap(), None);
+    on_b.put(b"k", b"3").await.unwrap();
+    assert_eq!(on_b.owner().await.unwrap().unwrap().node_id, "node-b");
+}
+
+#[tokio::test]
+async fn take_over_claims_a_database_whose_owner_died() {
+    let store = Arc::new(InMemory::new());
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    {
+        // Process a dies without releasing: its runtime and heartbeat stop.
+        let store = store.clone();
+        let path = dir_a.path().to_path_buf();
+        std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let a = ValkvEdge::builder(path)
+                    .options(Options {
+                        node_id: Some("node-a".into()),
+                        ..options()
+                    })
+                    .object_store(store, "tenant")
+                    .build()
+                    .unwrap();
+                a.database("app")
+                    .open()
+                    .await
+                    .unwrap()
+                    .put(b"k", b"acked")
+                    .await
+                    .unwrap();
+            });
+        })
+        .join()
+        .unwrap();
+    }
+    let b = writer_at(&dir_b, &store, "node-b", "10.0.0.2:7000");
+    let db = b.database("app").open().await.unwrap();
+    // Without waiting, the stale lease still looks held.
+    assert_eq!(db.put(b"k2", b"x").await.unwrap_err().code(), "LEASE_HELD");
+
+    let started = std::time::Instant::now();
+    db.take_over().await.unwrap();
+    assert!(
+        started.elapsed() >= options().lease.lease_ttl,
+        "it watched for a full TTL"
+    );
+    assert_eq!(
+        text(db.get(b"k").unwrap()).as_deref(),
+        Some("acked"),
+        "caught up on take-over"
+    );
+    assert_eq!(db.put(b"k2", b"after").await.unwrap().lsn, Some(2));
+    assert_eq!(db.owner().await.unwrap().unwrap().node_id, "node-b");
+}
+
 #[tokio::test]
 async fn namespaced_databases_have_their_own_prefix_and_replicate() {
     use futures::TryStreamExt;

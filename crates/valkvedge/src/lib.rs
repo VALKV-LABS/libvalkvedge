@@ -116,6 +116,11 @@ pub struct Options {
     /// Identity of this process among those sharing the object store.
     /// Random when not set.
     pub node_id: Option<String>,
+    /// An address written into the leases this process takes, so other
+    /// processes sharing the object store can tell where the owner of a
+    /// database can be reached. Empty when not set. The library does not
+    /// connect to it.
+    pub node_addr: String,
     /// Run the background task that pushes outboxes, pulls replicas and
     /// closes idle databases.
     pub background: bool,
@@ -141,6 +146,7 @@ impl Default for Options {
             lease: LeaseConfig::default(),
             writer: WriterConfig::default(),
             node_id: None,
+            node_addr: String::new(),
             background: true,
             sync_write_timeout: Duration::from_secs(10),
         }
@@ -308,7 +314,13 @@ impl Inner {
                         self.options.node_id.clone().unwrap_or_else(|| {
                             format!("direct-{}", valkvedge_log::DeviceId::random())
                         });
-                    Node::start(store.clone(), id, "", self.options.lease.clone()).await
+                    Node::start(
+                        store.clone(),
+                        id,
+                        self.options.node_addr.clone(),
+                        self.options.lease.clone(),
+                    )
+                    .await
                 })
                 .await?;
         Ok(node.clone())
@@ -674,6 +686,15 @@ impl DatabaseBuilder {
     }
 }
 
+/// The process that holds a database's lease. See [`Database::owner`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owner {
+    /// The owner's node id.
+    pub node_id: String,
+    /// The address the owner advertised, empty if it set none.
+    pub node_addr: String,
+}
+
 /// What a write returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Commit {
@@ -806,7 +827,8 @@ impl Database {
         if let Some(session) = slot.as_ref() {
             return Ok(session.clone());
         }
-        let session = Arc::new(self.start_session(open).await?);
+        let wait = self.kv.options.wait_for_lease;
+        let session = Arc::new(self.start_session(open, wait).await?);
         *slot = Some(session.clone());
         Ok(session)
     }
@@ -821,7 +843,7 @@ impl Database {
         }
     }
 
-    async fn start_session(&self, open: &Arc<Open>) -> Result<Session> {
+    async fn start_session(&self, open: &Arc<Open>, wait_for_lease: bool) -> Result<Session> {
         {
             {
                 let Some((store, layout)) = self.kv.layout(&self.shared.name) else {
@@ -845,7 +867,7 @@ impl Database {
                             open.store.clone(),
                             open.clock.clone(),
                             self.kv.options.writer.clone(),
-                            self.kv.options.wait_for_lease,
+                            wait_for_lease,
                         )
                         .await?;
                         let empty = writer.position().await?.applied_lsn == 0;
@@ -1136,6 +1158,48 @@ impl Database {
                 Ok(Some(valkvedge_sync::remote_head(&store, &layout).await?.1))
             }
         }
+    }
+
+    /// Who currently holds this database's lease, as recorded in the object
+    /// store: the owner's node id and the address it advertised. `None` when
+    /// nobody has ever owned it, when the last owner released it, or when
+    /// this client has no object store.
+    pub async fn owner(&self) -> Result<Option<Owner>> {
+        let Some((store, layout)) = self.kv.layout(&self.shared.name) else {
+            return Ok(None);
+        };
+        Ok(valkvedge_log::lease::read_lease(&store, &layout)
+            .await?
+            .filter(|lease| lease.state == valkvedge_log::LeaseState::Held)
+            .map(|lease| Owner {
+                node_id: lease.node_id,
+                node_addr: lease.node_addr,
+            }))
+    }
+
+    /// Becomes the writer of this database, waiting out a dead owner if
+    /// there is one.
+    ///
+    /// When another process holds the lease, this watches that process's
+    /// heartbeat for one lease TTL. If the heartbeat never changes, the owner
+    /// is dead and this process takes the database over. If the owner is
+    /// alive, this fails with `LEASE_HELD`. Unlike a write, the wait is not
+    /// cut short by `sync_write_timeout`.
+    ///
+    /// Use it when `wait_for_lease` is off and something outside the library
+    /// suggests the owner is gone, for example it cannot be reached.
+    pub async fn take_over(&self) -> Result<()> {
+        if self.kv.role() != Some(Role::Writer) {
+            return Err(ValkvEdgeError::ReadOnly(
+                "only a writer with an object store can take a database over".into(),
+            ));
+        }
+        let open = self.open()?;
+        let mut slot = open.session.lock().await;
+        if slot.is_none() {
+            *slot = Some(Arc::new(self.start_session(&open, true).await?));
+        }
+        Ok(())
     }
 
     /// Where this database lives in the object store, or `None` when this
