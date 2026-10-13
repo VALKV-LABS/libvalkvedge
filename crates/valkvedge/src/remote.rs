@@ -14,6 +14,9 @@ use valkvedge_sync::{Change, OpOutcome, OutboxEntry, PushReport, StateStore};
 
 /// Header carrying the error code of a failed request.
 const ERROR_CODE_HEADER: &str = "x-edgekv-error";
+/// Header by which this device names itself when it reads, so the service can
+/// tell which devices follow a database and how far each has got.
+const DEVICE_HEADER: &str = "x-edgekv-device";
 /// How long a download (log page or snapshot part) may take.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -21,6 +24,8 @@ pub(crate) struct Client {
     http: reqwest::Client,
     base: String,
     api_key: String,
+    /// This installation's id for the database: the same one its pushes carry.
+    device: DeviceId,
     /// Bound on a commit or a push.
     write_timeout: Duration,
 }
@@ -107,6 +112,7 @@ impl Client {
         base_url: &str,
         api_key: &str,
         database: &str,
+        device: DeviceId,
         write_timeout: Duration,
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
@@ -117,6 +123,7 @@ impl Client {
             http,
             base: format!("{}/v1/db/{database}", base_url.trim_end_matches('/')),
             api_key: api_key.to_string(),
+            device,
             write_timeout,
         })
     }
@@ -231,7 +238,10 @@ impl Client {
 
     /// The newest LSN the service holds for this database.
     pub(crate) async fn head(&self) -> Result<Lsn> {
-        let request = self.http.get(format!("{}/head", self.base));
+        let request = self
+            .http
+            .get(format!("{}/head", self.base))
+            .header(DEVICE_HEADER, self.device.to_string());
         let reply = self.json(request, self.write_timeout).await?;
         reply["lsn"]
             .as_u64()
@@ -239,7 +249,12 @@ impl Client {
     }
 
     async fn log(&self, after: Lsn) -> Result<LogPage> {
-        let request = self.http.get(format!("{}/log?after={after}", self.base));
+        // `after` is how far this device has read: with the device header,
+        // the service knows how far behind it is.
+        let request = self
+            .http
+            .get(format!("{}/log?after={after}", self.base))
+            .header(DEVICE_HEADER, self.device.to_string());
         let response = match self.send(request, DOWNLOAD_TIMEOUT).await {
             Ok(response) => response,
             Err(Error::Service {

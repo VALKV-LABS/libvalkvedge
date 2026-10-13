@@ -902,6 +902,7 @@ impl Database {
                         url,
                         api_key,
                         &self.shared.name,
+                        open.clock.device(),
                         self.kv.options.sync_write_timeout,
                     )?;
                     return Ok(Session::Remote(Box::new(client)));

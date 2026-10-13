@@ -526,3 +526,195 @@ impl Iterator for Iter {
         self.step().transpose()
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn store(dir: &tempfile::TempDir) -> LocalStore {
+        LocalStore::open(dir.path(), 8 * 1024 * 1024, false).unwrap()
+    }
+
+    fn hlc(ms: u64) -> Hlc {
+        Hlc {
+            physical_ms: ms,
+            counter: 0,
+            device: DeviceId([7; 16]),
+        }
+    }
+
+    fn entry(key: &str, value: &str) -> Record {
+        Record::Entry {
+            key: key.as_bytes().to_vec(),
+            value: value.as_bytes().to_vec(),
+            hlc: hlc(1),
+            tombstone: false,
+        }
+    }
+
+    fn pos(lsn: u64) -> ChainPos {
+        ChainPos {
+            generation: 1,
+            next_seq: 0,
+            prev_checksum: 0,
+            applied_lsn: lsn,
+        }
+    }
+
+    fn read(store: &LocalStore, key: &str) -> Option<String> {
+        store
+            .get_stored(key.as_bytes())
+            .unwrap()
+            .map(|v| String::from_utf8(v).unwrap())
+    }
+
+    fn all(store: &LocalStore) -> Vec<Record> {
+        let mut out = Vec::new();
+        store
+            .scan(&mut |record| {
+                out.push(record);
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn a_snapshot_loaded_in_parts_reads_back_exactly_including_tombstones_and_watermarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let first = vec![entry("a", "1"), entry("b", "2"), entry("c", "3")];
+        let second = vec![
+            entry("d", "4"),
+            Record::Entry {
+                key: b"e".to_vec(),
+                value: Vec::new(),
+                hlc: hlc(9),
+                tombstone: true,
+            },
+            Record::Watermark {
+                device: DeviceId([3; 16]),
+                seq: 42,
+            },
+        ];
+        store.begin_reset().unwrap();
+        store.load(&first).unwrap();
+        store.load(&second).unwrap();
+        assert!(
+            store.needs_bootstrap().unwrap(),
+            "not usable until finished"
+        );
+        store.finish_reset(pos(10)).unwrap();
+        assert!(!store.needs_bootstrap().unwrap());
+        assert_eq!(store.position().unwrap(), pos(10));
+        assert_eq!(read(&store, "a").as_deref(), Some("1"));
+        assert_eq!(read(&store, "d").as_deref(), Some("4"));
+        assert_eq!(read(&store, "e"), None, "a tombstone reads as absent");
+        assert_eq!(store.version_of(b"e").unwrap(), Some(hlc(9)));
+        assert_eq!(store.watermark(&DeviceId([3; 16])).unwrap(), 42);
+        let mut expected = first;
+        expected.extend(second);
+        assert_eq!(all(&store), expected);
+        // A loaded snapshot is the only copy this device has of that data:
+        // it must still be there, complete, after a restart.
+        drop(store);
+        let reopened = self::store(&dir);
+        assert!(!reopened.needs_bootstrap().unwrap());
+        assert_eq!(reopened.position().unwrap(), pos(10));
+        assert_eq!(all(&reopened), expected);
+    }
+
+    #[test]
+    fn a_first_load_that_was_cut_short_is_started_again_and_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = vec![entry("a", "1"), entry("b", "2"), entry("c", "3")];
+        {
+            let store = store(&dir);
+            store.begin_reset().unwrap();
+            store.load(&full[..2]).unwrap();
+            // The process dies here: no finish_reset.
+        }
+        let store = self::store(&dir);
+        assert!(
+            store.needs_bootstrap().unwrap(),
+            "the half-loaded copy is not trusted"
+        );
+        store.begin_reset().unwrap();
+        store.load(&full).unwrap();
+        store.finish_reset(pos(3)).unwrap();
+        assert_eq!(all(&store), full);
+        drop(store);
+        let reopened = self::store(&dir);
+        assert_eq!(all(&reopened), full);
+        assert_eq!(reopened.position().unwrap(), pos(3));
+    }
+
+    #[test]
+    fn loading_replaces_what_was_there_and_later_writes_win_over_loaded_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let frame = |lsn: u64, key: &str, value: &str, kind: OpKind| Frame {
+            lsn,
+            commit_hlc: hlc(lsn),
+            origin: None,
+            ops: vec![Op {
+                kind,
+                key: key.as_bytes().to_vec(),
+                value: value.as_bytes().to_vec(),
+                hlc: hlc(lsn),
+            }],
+        };
+        store
+            .apply(&[frame(1, "old", "gone", OpKind::Put)], pos(1))
+            .unwrap();
+        store
+            .apply(&[frame(2, "b", "before", OpKind::Put)], pos(2))
+            .unwrap();
+        store.begin_reset().unwrap();
+        store
+            .load(&[entry("a", "1"), entry("b", "loaded"), entry("c", "3")])
+            .unwrap();
+        store.finish_reset(pos(5)).unwrap();
+        assert_eq!(read(&store, "old"), None, "nothing from before survives");
+        assert_eq!(read(&store, "b").as_deref(), Some("loaded"));
+        // Writes applied after the load must be seen instead of what was loaded.
+        store
+            .apply(&[frame(6, "b", "newer", OpKind::Put)], pos(6))
+            .unwrap();
+        store
+            .apply(&[frame(7, "c", "", OpKind::Delete)], pos(7))
+            .unwrap();
+        assert_eq!(read(&store, "b").as_deref(), Some("newer"));
+        assert_eq!(read(&store, "c"), None);
+        assert_eq!(read(&store, "a").as_deref(), Some("1"));
+        // And they are still there after the files are closed and reopened.
+        drop(store);
+        let reopened = self::store(&dir);
+        assert_eq!(read(&reopened, "a").as_deref(), Some("1"));
+        assert_eq!(read(&reopened, "b").as_deref(), Some("newer"));
+        assert_eq!(read(&reopened, "c"), None);
+        assert_eq!(reopened.position().unwrap(), pos(7));
+    }
+
+    #[test]
+    fn records_that_are_not_in_key_order_are_still_loaded_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.begin_reset().unwrap();
+        // Out of order, and a key twice: the later record wins, as with writes.
+        store
+            .load(&[
+                entry("m", "1"),
+                entry("a", "2"),
+                entry("z", "3"),
+                entry("a", "4"),
+            ])
+            .unwrap();
+        // A second part may reach back before the first.
+        store.load(&[entry("b", "5"), entry("c", "6")]).unwrap();
+        store.load(&[]).unwrap();
+        store.finish_reset(pos(1)).unwrap();
+        for (key, value) in [("a", "4"), ("b", "5"), ("c", "6"), ("m", "1"), ("z", "3")] {
+            assert_eq!(read(&store, key).as_deref(), Some(value), "{key}");
+        }
+        assert_eq!(all(&store).len(), 5);
+    }
+}

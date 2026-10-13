@@ -46,6 +46,13 @@ Every request is `Authorization: Bearer <api key>` under `/v1/db/{database}`.
 
 Keys and values travel base64-encoded in JSON bodies.
 
+**Which device is asking.** On `GET /head` and `GET /log` the library also sends
+`X-Edgekv-Device: <uuid>`: the id this installation has for the database, the same one
+its pushes carry as `device_id`. Together with `after`, it tells the service how far
+each device has read, so it can show which devices follow a database and how far
+behind each is. The header is optional to a service that speaks this protocol; a
+request without it is answered the same way.
+
 **Commit**
 
 ```json
