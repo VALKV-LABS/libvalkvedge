@@ -37,6 +37,10 @@ struct Server {
     kv: ValkvEdge,
     store: Store,
     mode: AtomicU8,
+    /// The device named on each read of the log, and the position it read from.
+    readers: std::sync::Mutex<Vec<(String, u64)>>,
+    /// The device named in each push.
+    pushers: std::sync::Mutex<Vec<String>>,
 }
 
 type Shared = State<Arc<Server>>;
@@ -156,6 +160,7 @@ async fn push(
         *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
     }
     let device = DeviceId(device);
+    server.pushers.lock().unwrap().push(device.to_string());
     let entries = body["entries"]
         .as_array()
         .cloned()
@@ -225,6 +230,13 @@ async fn log(
         Err(response) => return response,
     };
     let after: u64 = query.get("after").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if let Some(device) = headers.get("x-edgekv-device").and_then(|v| v.to_str().ok()) {
+        server
+            .readers
+            .lock()
+            .unwrap()
+            .push((device.to_string(), after));
+    }
     let layout = Layout::new(db.object_prefix().unwrap());
     let mut frames = Vec::new();
     let mut generation = 0;
@@ -342,6 +354,8 @@ async fn service(dir: &tempfile::TempDir) -> Service {
         kv,
         store: Store::new(object_store),
         mode: AtomicU8::new(UP),
+        readers: std::sync::Mutex::new(Vec::new()),
+        pushers: std::sync::Mutex::new(Vec::new()),
     });
     let app = Router::new()
         .route("/v1/db/{db}/commit", post(commit))
@@ -696,4 +710,72 @@ async fn an_object_store_and_a_service_cannot_both_be_configured() {
         .err()
         .unwrap();
     assert_eq!(err.code(), "UNSUPPORTED");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_names_itself_when_it_reads_with_the_id_its_pushes_carry() {
+    let [sdir, adir, bdir] = dirs();
+    let service = service(&sdir).await;
+    let a = device(&adir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    for i in 0..5u8 {
+        a.put(&[b'k', i], b"v").await.unwrap();
+    }
+    let b = device(&bdir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(b.sync().await.unwrap(), 5);
+
+    let readers = service.server.readers.lock().unwrap().clone();
+    let mut devices: Vec<&str> = readers.iter().map(|(device, _)| device.as_str()).collect();
+    devices.sort_unstable();
+    devices.dedup();
+    assert_eq!(devices.len(), 2, "two devices, two ids: {readers:?}");
+    for device in &devices {
+        assert_eq!(device.len(), 36, "a UUID in its usual form: {device}");
+    }
+    // Each read says how far that device already is, so the last thing each
+    // one said is that it has everything.
+    for device in &devices {
+        let last = readers.iter().rev().find(|(d, _)| d == device).unwrap().1;
+        assert_eq!(last, 5, "{device} ended at the head");
+    }
+
+    // A buffered write is pushed under the same id the device reads with.
+    let before: Vec<String> = readers.iter().map(|(device, _)| device.clone()).collect();
+    let mut batch = b.batch();
+    batch.put(b"buffered", b"x");
+    batch.commit_with(Durability::Buffered).await.unwrap();
+    b.flush().await.unwrap();
+    let pushers = service.server.pushers.lock().unwrap().clone();
+    assert_eq!(pushers.len(), 1);
+    assert!(
+        before.contains(&pushers[0]),
+        "the pushing id {} is one of the reading ids",
+        pushers[0]
+    );
+
+    // Reopening the same directory keeps the id.
+    drop(b);
+    let again = device(&bdir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    again.sync().await.unwrap();
+    let last = service
+        .server
+        .readers
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .0
+        .clone();
+    assert_eq!(last, pushers[0]);
 }
