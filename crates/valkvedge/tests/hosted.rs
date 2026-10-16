@@ -368,6 +368,63 @@ async fn snapshot_part(
     object.bytes.into_response()
 }
 
+async fn kv_get(
+    State(server): Shared,
+    Path((database, key)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let db = match server.open(&headers, &database, false).await {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    match db.get_versioned(key.as_bytes()) {
+        Ok(Some((value, version))) => {
+            ([("x-edgekv-version", version.to_string())], value).into_response()
+        }
+        Ok(None) => error(StatusCode::NOT_FOUND, "KEY_NOT_FOUND", "key not found"),
+        Err(e) => library_error(e),
+    }
+}
+
+async fn kv_scan(
+    State(server): Shared,
+    Path(database): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let db = match server.open(&headers, &database, false).await {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    let prefix = query
+        .get("prefix")
+        .cloned()
+        .unwrap_or_default()
+        .into_bytes();
+    let limit: usize = query
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let after = query
+        .get("page_token")
+        .map(|token| B64.decode(token).unwrap());
+    let mut items = Vec::new();
+    let mut next_page_token = None;
+    for entry in db.prefix(&prefix).unwrap() {
+        let (key, value) = entry.unwrap();
+        if after.as_ref().is_some_and(|after| key <= *after) {
+            continue;
+        }
+        if items.len() == limit {
+            next_page_token = items.last().map(|item: &Value| item["key"].clone());
+            break;
+        }
+        let (_, version) = db.get_versioned(&key).unwrap().unwrap();
+        items.push(json!({ "key": B64.encode(&key), "value": B64.encode(&value), "version": version.to_string() }));
+    }
+    Json(json!({ "items": items, "next_page_token": next_page_token })).into_response()
+}
+
 struct Service {
     url: String,
     server: Arc<Server>,
@@ -410,6 +467,8 @@ async fn service(dir: &tempfile::TempDir) -> Service {
         .route("/v1/db/{db}/log", get(log))
         .route("/v1/db/{db}/snapshot", get(snapshot))
         .route("/v1/db/{db}/snapshot/parts/{part}", get(snapshot_part))
+        .route("/v1/db/{db}/kv", get(kv_scan))
+        .route("/v1/db/{db}/kv/{*key}", get(kv_get))
         .with_state(server.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1110,4 +1169,153 @@ async fn a_watch_is_told_to_reload_when_the_copy_is_rebuilt_from_a_snapshot() {
         .unwrap();
     assert_eq!(event, WatchEvent::Reset);
     assert_eq!(text(b.get(b"k").unwrap()).as_deref(), Some("2"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_database_opened_for_ingestion_uploads_its_writes_and_keeps_nothing() {
+    let [sdir, idir, rdir] = dirs();
+    let service = service(&sdir).await;
+    // Nothing reaches the service before the first push, so the push is
+    // what makes it take the database's lease: slower than the tight limit
+    // the other tests use when the machine is busy running them all.
+    let db = ValkvEdge::builder(idir.path())
+        .options(Options {
+            sync_write_timeout: Duration::from_secs(15),
+            ..fast()
+        })
+        .remote(&service.url, API_KEY)
+        .build()
+        .unwrap()
+        .database("readings")
+        .ingest()
+        .open()
+        .await
+        .unwrap();
+
+    // Writes are buffered by default: they return before the service has them.
+    assert!(db.put(b"t/1", b"20.5").await.unwrap().outbox_seq.is_some());
+    db.put(b"t/2", b"21.0").await.unwrap();
+    assert_eq!(db.status().unwrap().outbox_entries, 2);
+    // Nothing is read locally.
+    assert_eq!(db.get(b"t/1").unwrap_err().code(), "UNSUPPORTED");
+    assert!(matches!(db.prefix(b"t/"), Err(e) if e.code() == "UNSUPPORTED"));
+    assert!(db.watch(b"").is_err());
+
+    // Once uploaded, the outbox is empty and no copy was ever made.
+    assert_eq!(db.sync().await.unwrap(), 0);
+    let status = db.status().unwrap();
+    assert_eq!((status.outbox_entries, status.applied_lsn), (0, 0));
+
+    // Reads go to the service.
+    assert_eq!(
+        text(db.fetch(b"t/1").await.unwrap()).as_deref(),
+        Some("20.5")
+    );
+    assert_eq!(db.fetch(b"t/9").await.unwrap(), None);
+    let first = db.fetch_page(b"t/", 1, None).await.unwrap();
+    assert_eq!(first.entries, vec![(b"t/1".to_vec(), b"20.5".to_vec())]);
+    let rest = db
+        .fetch_page(b"t/", 10, first.next_page_token.as_deref())
+        .await
+        .unwrap();
+    assert_eq!(rest.entries, vec![(b"t/2".to_vec(), b"21.0".to_vec())]);
+    assert_eq!(rest.next_page_token, None);
+
+    // Sync and conditional writes go straight to the service.
+    let mut batch = db.batch();
+    batch.put(b"t/3", b"22.0");
+    assert!(batch
+        .commit_with(Durability::Sync)
+        .await
+        .unwrap()
+        .lsn
+        .is_some());
+    let increment = |current: Option<&[u8]>| {
+        let n: u32 = current.map_or(0, |v| std::str::from_utf8(v).unwrap().parse().unwrap());
+        Some((n + 1).to_string().into_bytes())
+    };
+    db.update(b"count", increment).await.unwrap();
+    db.update(b"count", increment).await.unwrap();
+    assert_eq!(
+        text(db.fetch(b"count").await.unwrap()).as_deref(),
+        Some("2")
+    );
+
+    // An ordinary replica of the same database sees all of it.
+    let other = replica(&rdir, &service, API_KEY)
+        .database("readings")
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(text(other.get(b"t/3").unwrap()).as_deref(), Some("22.0"));
+    assert_eq!(text(other.get(b"count").unwrap()).as_deref(), Some("2"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingestion_needs_a_service_and_one_way_of_opening_per_database() {
+    let [sdir, ldir, idir] = dirs();
+    let local = ValkvEdge::builder(ldir.path())
+        .options(fast())
+        .build()
+        .unwrap();
+    let refused = local.database("readings").ingest().open().await;
+    assert_eq!(refused.err().unwrap().code(), "UNSUPPORTED");
+
+    let service = service(&sdir).await;
+    let kv = replica(&idir, &service, API_KEY);
+    let _ingesting = kv.database("readings").ingest().open().await.unwrap();
+    let other_way = kv.database("readings").open().await;
+    assert_eq!(other_way.err().unwrap().code(), "UNSUPPORTED");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_reads_the_newest_value_from_the_service_and_opens_sealed_values() {
+    let [sdir, adir, bdir] = dirs();
+    let service = service(&sdir).await;
+    let key = [7u8; 32];
+    let follower = replica(&adir, &service, API_KEY)
+        .database("vault")
+        .encryption_key(key)
+        .open()
+        .await
+        .unwrap();
+    let sensor = replica(&bdir, &service, API_KEY)
+        .database("vault")
+        .encryption_key(key)
+        .ingest()
+        .open()
+        .await
+        .unwrap();
+    sensor.put(b"secret", b"hello").await.unwrap();
+    sensor.flush().await.unwrap();
+
+    // The service only ever held the sealed value.
+    let held = service
+        .server
+        .kv
+        .database("vault")
+        .open()
+        .await
+        .unwrap()
+        .get(b"secret")
+        .unwrap()
+        .unwrap();
+    assert_ne!(held, b"hello");
+    assert_eq!(
+        text(sensor.fetch(b"secret").await.unwrap()).as_deref(),
+        Some("hello")
+    );
+
+    // A replica whose copy is behind (no background sync in these tests)
+    // reads the newest value with fetch.
+    assert_eq!(follower.get(b"secret").unwrap(), None);
+    assert_eq!(
+        text(follower.fetch(b"secret").await.unwrap()).as_deref(),
+        Some("hello")
+    );
+    // Keys travel in the URL, so fetch reads text keys only.
+    assert_eq!(
+        follower.fetch(&[0xff, 0x00]).await.unwrap_err().code(),
+        "UNSUPPORTED"
+    );
 }

@@ -71,7 +71,29 @@ let kv = ValkvEdge::builder(dir)
 The library asks once per database, and again a minute before the token expires (it
 reads the `exp` claim of the token) or whenever the service refuses it with
 `TOKEN_EXPIRED` or `UNAUTHENTICATED`; it then repeats the refused request once with the
-new token. Reads never need a token: they are local.
+new token. Local reads never need a token.
+
+## Reading from the service, and writing without a copy
+
+`Database::fetch(key)`, `fetch_versioned` and `fetch_page(prefix, limit, page_token)`
+read from the service rather than the local copy: the newest stored value, at the cost
+of a request. Keys and prefixes read this way must be UTF-8 text, since they travel in
+the URL. Encrypted values are opened on the replica as usual.
+
+A device that mostly writes, such as a sensor, needs no copy of the whole database.
+Open it for ingestion:
+
+```rust
+let readings = kv.database("readings").ingest().open().await?;
+readings.put(b"temp/2026-10-15T10:00", b"20.5").await?; // buffered: returns at once
+let latest = readings.fetch(b"temp/2026-10-15T10:00").await?; // read from the service
+```
+
+Writes are buffered on local disk, uploaded in the background, and removed once the
+service has them; nothing is downloaded, so the local directory holds only what has not
+been uploaded yet. `get`, `prefix`, `range` and `watch` fail with `UNSUPPORTED`; read
+with `fetch`. Sync and conditional writes, and `update`, go straight to the service. A
+database is opened one way per process: for ingestion or not.
 
 ## What the client needs from the service
 
@@ -90,6 +112,8 @@ Every request is `Authorization: Bearer <api key or token>` under `/v1/db/{datab
 | `GET /log?after={lsn}` | Frames after an LSN | Binary: one [segment](format.md#segment), with the generation in `x-edgekv-generation` |
 | `GET /snapshot` | Current snapshot | `{ "generation", "snapshot_lsn", "parts": [{ "url", "size", "checksum" }] }` |
 | `GET {part url}` | One snapshot part | Binary: one [snapshot part](format.md#snapshot-part) |
+| `GET /kv/{key}` | One value, for `fetch` | The value, with its version in `x-edgekv-version`; `404` `KEY_NOT_FOUND` if there is none |
+| `GET /kv?prefix=&limit=&page_token=` | A page of keys, for `fetch_page` | `{ "items": [{ "key", "value", "version" }], "next_page_token" }`, keys and values base64 |
 
 Keys and values travel base64-encoded in JSON bodies.
 
