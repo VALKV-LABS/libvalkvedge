@@ -26,6 +26,53 @@ Everything else is the same API. What changes is where things happen:
 Databases are addressed by the names they have in the service. Create them there first;
 opening a name the API key cannot see fails with `NOT_FOUND`.
 
+Conditional writes (`Batch::if_version`, `Database::update`) are checked by the
+service, against the newest data. If the local copy was behind and the condition
+fails, the library brings the copy up to date before returning `CONDITION_FAILED`, so
+the next read sees the value that won. `Database::watch` reports changes as they
+arrive from the service, which with the background task running is about once per
+`pull_interval`.
+
+## Devices you do not control: tokens
+
+An API key is for your servers. An app on a user's phone or in a browser should not
+carry one: anyone can take it out of the app. Give such devices short-lived tokens
+instead. Your backend keeps the API key, decides who the user is, and asks the service
+for a token that works for one database, read-only or read-write, for a limited time:
+
+```http
+POST /v1/db/{database}/tokens
+Authorization: Bearer ekv_your_api_key
+Content-Type: application/json
+
+{ "scope": "write", "ttl_seconds": 3600, "subject": "user-123" }
+```
+
+```json
+{ "token": "eyJ…", "scope": "write", "expires_at": "2026-10-15T13:00:00Z" }
+```
+
+`scope` is `read` or `write` (default `read`); a read-only API key can only mint `read`
+tokens. `ttl_seconds` is 60 to 86,400 (default 3,600). `subject` is optional and is
+recorded in the token for your own reference. A token stops working when it expires
+or when the API key that minted it is revoked. A token cannot mint tokens.
+
+On the device, give the library a way to get tokens from your backend instead of a key:
+
+```rust
+let kv = ValkvEdge::builder(dir)
+    .remote_with_tokens("https://api.example.com", |database: String| async move {
+        // Ask your own backend, which checks who is signed in.
+        my_backend::edge_token(&database).await
+    })
+    .build()?;
+```
+
+The library asks once per database, and again a minute before the token expires (it
+reads the `exp` claim of the token) or whenever the service refuses it with
+`TOKEN_EXPIRED` or `UNAUTHENTICATED`; it then repeats the refused request once with the
+new token. Reads never need a token: they are local.
+
 ## What the client needs from the service
 
 The client speaks a small HTTP API. This section is for anyone who wants to check what
@@ -33,11 +80,11 @@ the library sends, or to stand up something that speaks the same protocol. The
 [reference server in the tests](../crates/valkvedge/tests/hosted.rs) implements all of
 it in about 250 lines.
 
-Every request is `Authorization: Bearer <api key>` under `/v1/db/{database}`.
+Every request is `Authorization: Bearer <api key or token>` under `/v1/db/{database}`.
 
 | Request | Purpose | Success response |
 |---|---|---|
-| `POST /commit` | One atomic sync write | `{ "lsn": 42 }` |
+| `POST /commit` | One atomic sync write | `{ "lsn": 42, "versions": ["…"] }` |
 | `POST /push` | Hand over outbox entries | `{ "watermark", "lsn", "entries": [{ "seq", "results": [...] }] }` |
 | `GET /head` | Newest LSN | `{ "generation", "lsn" }` |
 | `GET /log?after={lsn}` | Frames after an LSN | Binary: one [segment](format.md#segment), with the generation in `x-edgekv-generation` |
@@ -59,8 +106,20 @@ request without it is answered the same way.
 { "ops": [
   { "op": "put", "key": "YQ==", "value": "MQ==" },
   { "op": "delete", "key": "Yg==" }
+],
+  "conditions": [
+  { "key": "YQ==", "version": "8a1b…" },
+  { "key": "Yg==", "version": null }
 ] }
 ```
+
+`conditions` is optional. Each names a key and the version its value must be at, or
+`null` for "has no value". If any does not hold, nothing is written and the service
+answers `412` with code `CONDITION_FAILED` and the key, base64-encoded, in
+`error.key`. `versions` in the response has one entry per operation: the version that
+write gave its key. A version is 56 hex characters, the
+[timestamp](format.md) the write was stamped with; the library's `Version` parses and
+prints them.
 
 **Push**
 
@@ -98,8 +157,10 @@ The library turns these into `ValkvEdgeError`, and `code()` returns the same str
 
 | Code | What it means for your program |
 |---|---|
-| `UNAUTHENTICATED` | The API key is missing, wrong or revoked |
-| `FORBIDDEN` | The key may not do this, for example a read-only key writing |
+| `UNAUTHENTICATED` | The API key or token is missing, wrong or revoked |
+| `TOKEN_EXPIRED` | The token has expired; with `remote_with_tokens` the library gets a new one and retries |
+| `FORBIDDEN` | The key may not do this, for example a read-only key or token writing |
+| `CONDITION_FAILED` | A conditional write found a key at another version; nothing was written |
 | `NOT_FOUND` | No such database for this key |
 | `ACCOUNT_SUSPENDED` | The account cannot be used at the moment |
 | `DATABASE_NOT_READY` | The database exists but cannot take this request yet |

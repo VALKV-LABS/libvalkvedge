@@ -26,6 +26,11 @@ pub trait StateStore: Send + Sync + 'static {
     /// Timestamp of the latest operation on `key`, including a delete.
     fn version_of(&self, key: &[u8]) -> Result<Option<Hlc>>;
 
+    /// Timestamp of the value `key` holds now: `None` when the key was never
+    /// written or its latest operation is a delete. Conditional writes are
+    /// checked against this.
+    fn live_version(&self, key: &[u8]) -> Result<Option<Hlc>>;
+
     /// Highest outbox sequence number applied for `device`, 0 if none.
     fn watermark(&self, device: &DeviceId) -> Result<u64>;
 
@@ -116,6 +121,14 @@ impl StateStore for MemState {
     fn version_of(&self, key: &[u8]) -> Result<Option<Hlc>> {
         let inner = self.inner.lock().expect("mem state lock");
         Ok(inner.data.get(key).map(|(_, hlc, _)| *hlc))
+    }
+
+    fn live_version(&self, key: &[u8]) -> Result<Option<Hlc>> {
+        let inner = self.inner.lock().expect("mem state lock");
+        Ok(match inner.data.get(key) {
+            Some((_, hlc, false)) => Some(*hlc),
+            _ => None,
+        })
     }
 
     fn watermark(&self, device: &DeviceId) -> Result<u64> {

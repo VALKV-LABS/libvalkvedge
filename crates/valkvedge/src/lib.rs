@@ -30,28 +30,56 @@
 //!   outbox. It is readable at once and uploaded in batches. It works offline.
 //!   It can be lost if the device is lost before the upload, and it can lose a
 //!   conflict to a newer write to the same key (see [`Database::take_events`]).
+//!
+//! # Conditional writes
+//!
+//! Every value has a [`Version`] that changes with each write to its key.
+//! A sync batch can require keys to be at a version, or to have no value,
+//! and is then written only if they are. Use it for counters, stock levels and
+//! anything else where last write wins would lose an update:
+//!
+//! ```no_run
+//! # async fn demo(db: valkvedge::Database) -> Result<(), valkvedge::ValkvEdgeError> {
+//! // Read, change and write back, retried if another writer got there first.
+//! db.update(b"stock/sku-1", |current| {
+//!     let n: u64 = current.map_or(0, |v| String::from_utf8_lossy(v).parse().unwrap_or(0));
+//!     Some((n - 1).to_string().into_bytes())
+//! })
+//! .await?;
+//! # Ok(()) }
+//! ```
+//!
+//! # Watching for changes
+//!
+//! [`Database::watch`] reports every change to keys under a prefix as it
+//! reaches the local copy, whoever made it: this process, a replica pull, or
+//! another device's write arriving from a hosted service.
 
 #![forbid(unsafe_code)]
 
 mod crypto;
 mod local;
 mod remote;
+mod watch;
 
 use crypto::Cipher;
-use local::LocalStore;
+use local::{ChangeFeed, LocalStore};
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::ops::{Bound, RangeBounds};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use valkvedge_log::{HlcClock, Layout, Node, Store};
-use valkvedge_sync::{Change, StateStore, Writer};
+use valkvedge_sync::{Change, Condition, StateStore, Writer};
 
 pub use local::Iter;
 pub use valkvedge_log::{DeviceId, Hlc, Op};
 pub use valkvedge_log::{Error as ValkvEdgeError, LeaseConfig, Lsn, OpKind, RejectReason, Result};
 pub use valkvedge_sync::{OpOutcome, OutboxEntry, PushReport, WriterConfig};
+pub use watch::{Watch, WatchEvent};
 
 /// Re-export of the object store crate, for building a store to pass to
 /// [`Builder::object_store`].
@@ -164,8 +192,43 @@ enum Backend {
     /// A service owns the databases; this process reaches them over HTTP.
     Remote {
         url: String,
-        api_key: String,
+        auth: Auth,
     },
+}
+
+/// How this process proves itself to a hosted service.
+#[derive(Clone)]
+pub(crate) enum Auth {
+    /// An account API key, the same for every database.
+    ApiKey(String),
+    /// Short-lived tokens, one per database, fetched when needed.
+    Tokens(Arc<dyn TokenSource>),
+}
+
+/// The future a [`TokenSource`] returns.
+pub type TokenFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
+
+/// Supplies short-lived access tokens for a hosted service, one database at
+/// a time. See [`Builder::remote_with_tokens`].
+///
+/// Usually this asks your own backend, which holds the API key and mints
+/// tokens for the user signed in on this device. It is called when a
+/// database is first used, shortly before its token expires, and when the
+/// service refuses a token. Any closure `Fn(String) -> impl Future<Output =
+/// Result<String>>` is a token source; it receives the database name.
+pub trait TokenSource: Send + Sync + 'static {
+    /// A token for `database`.
+    fn token(&self, database: &str) -> TokenFuture;
+}
+
+impl<F, Fut> TokenSource for F
+where
+    F: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<String>> + Send + 'static,
+{
+    fn token(&self, database: &str) -> TokenFuture {
+        Box::pin(self(database.to_string()))
+    }
 }
 
 /// Configures and creates a [`ValkvEdge`].
@@ -173,7 +236,7 @@ pub struct Builder {
     root: PathBuf,
     options: Options,
     object: Option<(Store, String)>,
-    remote: Option<(String, String)>,
+    remote: Option<(String, Auth)>,
     role: Role,
 }
 
@@ -216,7 +279,21 @@ impl Builder {
     /// Databases are addressed by the names they have in the service. See
     /// `docs/hosted-api.md`.
     pub fn remote(mut self, url: impl Into<String>, api_key: impl Into<String>) -> Self {
-        self.remote = Some((url.into(), api_key.into()));
+        self.remote = Some((url.into(), Auth::ApiKey(api_key.into())));
+        self
+    }
+
+    /// Connects to a hosted service with short-lived tokens instead of an
+    /// API key.
+    ///
+    /// Use this on devices you do not control, such as an app on a user's
+    /// phone: the API key stays on your backend, which mints a token for one
+    /// database with read or write access, and the device never holds more
+    /// than that. `tokens` is asked for a token per database and asked again
+    /// before one expires or when the service refuses it. Everything else
+    /// works as with [`Builder::remote`].
+    pub fn remote_with_tokens(mut self, url: impl Into<String>, tokens: impl TokenSource) -> Self {
+        self.remote = Some((url.into(), Auth::Tokens(Arc::new(tokens))));
         self
     }
 
@@ -235,7 +312,7 @@ impl Builder {
                 prefix: prefix.trim_matches('/').to_string(),
                 role: self.role,
             },
-            (None, Some((url, api_key))) => Backend::Remote { url, api_key },
+            (None, Some((url, auth))) => Backend::Remote { url, auth },
         };
         let inner = Arc::new(Inner {
             root: self.root,
@@ -296,6 +373,8 @@ struct Shared {
     cipher: OnceLock<Option<Arc<Cipher>>>,
     flush_lock: tokio::sync::Mutex<()>,
     events: Mutex<VecDeque<WriteEvent>>,
+    /// Changes to the local copy, for [`Database::watch`].
+    feed: ChangeFeed,
 }
 
 struct Open {
@@ -400,6 +479,7 @@ impl Inner {
                 &shared.path,
                 self.options.cache_bytes_per_database,
                 self.options.local_fsync,
+                shared.feed.clone(),
             ) {
                 Ok(store) => return Ok(store),
                 Err(e) if Instant::now() >= deadline => return Err(e),
@@ -677,6 +757,7 @@ impl DatabaseBuilder {
                     cipher: OnceLock::new(),
                     flush_lock: tokio::sync::Mutex::new(()),
                     events: Mutex::new(VecDeque::new()),
+                    feed: tokio::sync::broadcast::channel(WATCH_BUFFER).0,
                 })
             })
             .clone();
@@ -741,13 +822,77 @@ pub struct Owner {
     pub node_addr: String,
 }
 
+/// The version of a key's value. Every write to a key gives it a new one.
+///
+/// Read it with [`Database::get_versioned`] and require it with
+/// [`Batch::if_version`]. As text it is 56 lowercase hex characters; treat
+/// that as opaque.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Version(Hlc);
+
+impl Version {
+    /// The timestamp the write was stamped with.
+    pub fn hlc(&self) -> Hlc {
+        self.0
+    }
+
+    /// The version of a write stamped `hlc`.
+    pub fn from_hlc(hlc: Hlc) -> Self {
+        Version(hlc)
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut bytes = Vec::with_capacity(Hlc::SIZE);
+        self.0.encode(&mut bytes);
+        for byte in bytes {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// A string that is not a [`Version`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidVersion;
+
+impl std::fmt::Display for InvalidVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a version is {} hex characters", Hlc::SIZE * 2)
+    }
+}
+
+impl std::error::Error for InvalidVersion {}
+
+impl std::str::FromStr for Version {
+    type Err = InvalidVersion;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        if text.len() != Hlc::SIZE * 2 || !text.is_ascii() {
+            return Err(InvalidVersion);
+        }
+        let bytes = (0..Hlc::SIZE)
+            .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16))
+            .collect::<std::result::Result<Vec<u8>, _>>()
+            .map_err(|_| InvalidVersion)?;
+        let mut dec = valkvedge_log::types::Dec::new(&bytes);
+        Hlc::decode(&mut dec)
+            .map(Version)
+            .map_err(|_| InvalidVersion)
+    }
+}
+
 /// What a write returned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     /// The frame's position in the log, for writes that reached it.
     pub lsn: Option<Lsn>,
     /// The outbox sequence number, for buffered writes.
     pub outbox_seq: Option<u64>,
+    /// The version each write in the batch gave its key, in batch order.
+    /// Empty when a hosted service did not report them.
+    pub versions: Vec<Version>,
 }
 
 /// A point-in-time summary of a database's local state.
@@ -786,6 +931,11 @@ pub enum WriteOutcome {
 }
 
 const MAX_EVENTS: usize = 1024;
+/// Batches of changes a watcher may fall behind by before it is told to
+/// reload ([`WatchEvent::Reset`]).
+const WATCH_BUFFER: usize = 1024;
+/// How many times [`Database::update`] tries before giving up.
+const UPDATE_ATTEMPTS: usize = 16;
 
 /// A handle to one database. Cheap to clone.
 ///
@@ -821,6 +971,87 @@ impl Database {
             (Some(stored), None) => Ok(Some(stored)),
             (Some(stored), Some(cipher)) => cipher.open(key, &stored).map(Some),
         }
+    }
+
+    /// Reads a key and the version of its value from the local store. Never
+    /// touches the network.
+    ///
+    /// Pass the version to [`Batch::if_version`] to write only if nobody has
+    /// written the key since. With a hosted service or as a replica, the
+    /// local copy may be a moment behind; a write conditioned on an old
+    /// version then fails and the copy is brought up to date.
+    pub fn get_versioned(&self, key: &[u8]) -> Result<Option<(Vec<u8>, Version)>> {
+        let open = self.open()?;
+        match open.store.get_stored_versioned(key)? {
+            None => Ok(None),
+            Some((stored, hlc)) => {
+                let value = match self.cipher() {
+                    None => stored,
+                    Some(cipher) => cipher.open(key, &stored)?,
+                };
+                Ok(Some((value, Version(hlc))))
+            }
+        }
+    }
+
+    /// Reports changes to keys starting with `prefix` as they reach the local
+    /// copy: writes made here, buffered writes settling, and changes pulled
+    /// from the object store or a hosted service. An empty prefix watches
+    /// everything.
+    ///
+    /// A watched database stays open, and keeps following its hosted service
+    /// or object store in the background, until the [`Watch`] is dropped.
+    pub fn watch(&self, prefix: &[u8]) -> Result<Watch> {
+        let open = self.open()?;
+        Ok(Watch::new(
+            self.clone(),
+            open,
+            prefix.to_vec(),
+            self.shared.feed.subscribe(),
+        ))
+    }
+
+    /// Reads a key, computes its new value with `change`, and writes it back
+    /// if nobody else wrote the key in between, trying again if they did.
+    ///
+    /// `change` gets the current value (`None` when there is none) and
+    /// returns the new one (`None` deletes the key); it may run more than
+    /// once. The write is a sync write. Fails with `CONDITION_FAILED` if the
+    /// key keeps changing for 16 attempts.
+    pub async fn update<F>(&self, key: &[u8], mut change: F) -> Result<Commit>
+    where
+        F: FnMut(Option<&[u8]>) -> Option<Vec<u8>>,
+    {
+        // A pending buffered write to the key would make every check fail
+        // until it settles.
+        if self.shared.has_outbox.load(Ordering::Relaxed) {
+            self.flush().await?;
+        }
+        for _ in 0..UPDATE_ATTEMPTS {
+            let current = self.get_versioned(key)?;
+            let next = change(current.as_ref().map(|(value, _)| value.as_slice()));
+            let mut batch = self.batch();
+            match &current {
+                Some((_, version)) => batch.if_version(key, version),
+                None => batch.if_absent(key),
+            };
+            match (&current, next) {
+                (None, None) => {
+                    return Ok(Commit {
+                        lsn: None,
+                        outbox_seq: None,
+                        versions: Vec::new(),
+                    })
+                }
+                (_, Some(value)) => batch.put(key, &value),
+                (Some(_), None) => batch.delete(key),
+            };
+            match batch.commit_with(Durability::Sync).await {
+                Err(ValkvEdgeError::ConditionFailed { .. }) => continue,
+                other => return other,
+            }
+        }
+        Err(ValkvEdgeError::ConditionFailed { key: key.to_vec() })
     }
 
     /// Iterates keys in `range`, in order, from the local store.
@@ -863,6 +1094,7 @@ impl Database {
         Batch {
             db: self.clone(),
             changes: Vec::new(),
+            conditions: Vec::new(),
         }
     }
 
@@ -892,7 +1124,7 @@ impl Database {
     async fn start_session(&self, open: &Arc<Open>, wait_for_lease: bool) -> Result<Session> {
         {
             {
-                if let Backend::Remote { url, api_key } = &self.kv.backend {
+                if let Backend::Remote { url, auth } = &self.kv.backend {
                     if self.shared.name.contains('/') {
                         return Err(ValkvEdgeError::Unsupported(
                             "namespaces are not available with a hosted service".into(),
@@ -900,7 +1132,7 @@ impl Database {
                     }
                     let client = remote::Client::new(
                         url,
-                        api_key,
+                        auth.clone(),
                         &self.shared.name,
                         open.clock.device(),
                         self.kv.options.sync_write_timeout,
@@ -977,7 +1209,13 @@ impl Database {
     }
 
     /// A sync write through the writer, bounded by `sync_write_timeout`.
-    async fn commit_sync(&self, open: &Arc<Open>, changes: Vec<Change>) -> Result<Lsn> {
+    /// Returns its LSN and the timestamp of each change.
+    async fn commit_sync(
+        &self,
+        open: &Arc<Open>,
+        changes: Vec<Change>,
+        conditions: &[Condition],
+    ) -> Result<(Lsn, Vec<Hlc>)> {
         let limit = self.kv.options.sync_write_timeout;
         let started = Instant::now();
         let unavailable = |what: &str| {
@@ -989,7 +1227,19 @@ impl Database {
         if let Session::Remote(client) = session.as_ref() {
             // The service stores the write; the local copy then catches up to
             // it, so a read right after this returns sees it.
-            let lsn = client.commit(&changes).await?;
+            let (lsn, stamps) = match client.commit(&changes, conditions).await {
+                Ok(done) => done,
+                Err(e @ ValkvEdgeError::ConditionFailed { .. }) => {
+                    // The local copy was behind what the condition was
+                    // checked against. Catch up, so the caller's next read
+                    // sees the value that won.
+                    if let Err(pull) = client.pull(open.store.as_ref()).await {
+                        tracing::warn!(database = %self.shared.name, error = %pull, "could not catch up after a failed condition");
+                    }
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
             while open.store.position()?.applied_lsn < lsn {
                 let reached = client.pull(open.store.as_ref()).await?;
                 if reached < lsn {
@@ -998,7 +1248,7 @@ impl Database {
                     ));
                 }
             }
-            return Ok(lsn);
+            return Ok((lsn, stamps));
         }
         let Session::Writer(writer) = session.as_ref() else {
             return Err(ValkvEdgeError::ReadOnly(
@@ -1010,15 +1260,18 @@ impl Database {
         // commit leaves the writer in an unknown position, so the session is
         // dropped and the next write starts from what the log really holds.
         let remaining = limit.saturating_sub(started.elapsed());
-        let result = match tokio::time::timeout(remaining, writer.commit(changes)).await {
+        let committing = writer.commit_if(changes, conditions);
+        let result = match tokio::time::timeout(remaining, committing).await {
             Ok(result) => result,
             Err(_) => Err(unavailable("the object store did not confirm the write")),
         };
         match result {
-            Ok(lsn) => {
+            Ok(done) => {
                 self.compact_if_due(open, &session).await;
-                Ok(lsn)
+                Ok(done)
             }
+            // Checked before anything was written: the writer is fine.
+            Err(e @ ValkvEdgeError::ConditionFailed { .. }) => Err(e),
             Err(e) => {
                 self.reset_session(open, &session).await;
                 Err(e)
@@ -1026,14 +1279,25 @@ impl Database {
         }
     }
 
-    async fn write(&self, mut changes: Vec<Change>, durability: Durability) -> Result<Commit> {
+    async fn write(
+        &self,
+        mut changes: Vec<Change>,
+        conditions: Vec<Condition>,
+        durability: Durability,
+    ) -> Result<Commit> {
         let mut total = 0;
-        for change in &changes {
-            if change.key.is_empty() || change.key.len() > MAX_KEY_BYTES {
+        let keys = changes
+            .iter()
+            .map(|c| &c.key)
+            .chain(conditions.iter().map(|c| &c.key));
+        for key in keys {
+            if key.is_empty() || key.len() > MAX_KEY_BYTES {
                 return Err(ValkvEdgeError::KeyTooLarge {
                     limit: MAX_KEY_BYTES,
                 });
             }
+        }
+        for change in &changes {
             if change.value.len() > MAX_VALUE_BYTES {
                 return Err(ValkvEdgeError::ValueTooLarge {
                     limit: MAX_VALUE_BYTES,
@@ -1050,6 +1314,7 @@ impl Database {
             return Ok(Commit {
                 lsn: None,
                 outbox_seq: None,
+                versions: Vec::new(),
             });
         }
         if let Some(cipher) = self.cipher() {
@@ -1070,6 +1335,12 @@ impl Database {
             (Some(Role::Replica), _) => Err(ValkvEdgeError::ReadOnly(
                 "this process follows the database as a replica".into(),
             )),
+            (Some(Role::Writer), Durability::Buffered) if !conditions.is_empty() => {
+                Err(ValkvEdgeError::Unsupported(
+                    "conditional writes must be sync writes: a buffered write cannot know what it will be checked against"
+                        .into(),
+                ))
+            }
             (Some(Role::Writer), Durability::Buffered) => {
                 // No network and no session: this path must work offline.
                 // A write made now is later than whatever this device already
@@ -1089,6 +1360,7 @@ impl Database {
                         hlc: open.clock.now(),
                     })
                     .collect();
+                let versions = ops.iter().map(|op| Version(op.hlc)).collect();
                 let seq = open.store.buffer(&ops, self.kv.options.outbox_max_bytes)?;
                 self.shared.has_outbox.store(true, Ordering::Relaxed);
                 if open.store.outbox_stat()?.bytes >= self.kv.options.push_bytes {
@@ -1104,21 +1376,26 @@ impl Database {
                 Ok(Commit {
                     lsn: None,
                     outbox_seq: Some(seq),
+                    versions,
                 })
             }
             (None, _) => {
                 // No object store: the local store is the database.
-                let lsn = open.store.apply_local(changes, || open.clock.now())?;
+                let (lsn, stamps) =
+                    open.store
+                        .apply_local(changes, &conditions, || open.clock.now())?;
                 Ok(Commit {
                     lsn: Some(lsn),
                     outbox_seq: None,
+                    versions: stamps.into_iter().map(Version).collect(),
                 })
             }
             (Some(Role::Writer), Durability::Sync) => {
-                let lsn = self.commit_sync(&open, changes).await?;
+                let (lsn, stamps) = self.commit_sync(&open, changes, &conditions).await?;
                 Ok(Commit {
                     lsn: Some(lsn),
                     outbox_seq: None,
+                    versions: stamps.into_iter().map(Version).collect(),
                 })
             }
         }
@@ -1404,12 +1681,39 @@ impl Database {
 }
 
 /// An atomic group of writes. All of it is applied, or none of it.
+///
+/// A batch can also carry conditions ([`Batch::if_version`],
+/// [`Batch::if_absent`]): it is then applied only if every one holds when
+/// the writer orders it, and otherwise fails with `CONDITION_FAILED` having
+/// written nothing. Conditions need a sync write; with buffered durability
+/// the commit fails with `UNSUPPORTED`.
 pub struct Batch {
     db: Database,
     changes: Vec<Change>,
+    conditions: Vec<Condition>,
 }
 
 impl Batch {
+    /// Applies the batch only if `key`'s value is still at `version`: nobody
+    /// has written or deleted it since that version was read.
+    pub fn if_version(&mut self, key: &[u8], version: &Version) -> &mut Self {
+        self.conditions.push(Condition {
+            key: key.to_vec(),
+            version: Some(version.0),
+        });
+        self
+    }
+
+    /// Applies the batch only if `key` has no value: it was never written,
+    /// or its last write was a delete.
+    pub fn if_absent(&mut self, key: &[u8]) -> &mut Self {
+        self.conditions.push(Condition {
+            key: key.to_vec(),
+            version: None,
+        });
+        self
+    }
+
     /// Adds a put.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> &mut Self {
         self.changes.push(Change {
@@ -1448,6 +1752,8 @@ impl Batch {
 
     /// Commits with the given durability.
     pub async fn commit_with(self, durability: Durability) -> Result<Commit> {
-        self.db.write(self.changes, durability).await
+        self.db
+            .write(self.changes, self.conditions, durability)
+            .await
     }
 }

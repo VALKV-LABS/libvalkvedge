@@ -26,6 +26,11 @@ conditional writes rather than a lock service.
   closed and reopen on next use without the caller noticing.
 - **Optional encryption.** Values are sealed with a key you supply before they are
   written anywhere. Keys (the key names) are not encrypted.
+- **Conditional writes.** Every value has a version. A sync batch can require keys to
+  be at a version, or absent, and is written only if they are; `Database::update` reads,
+  changes and writes back with retries. Counters and stock levels lose no updates.
+- **Change subscriptions.** `Database::watch(prefix)` reports every change under a
+  prefix as it reaches the local copy, whoever made it, so a UI can follow the data.
 
 ## Quick start
 
@@ -77,7 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Leave out `.object_store(...)` for a purely local database. To use a hosted service
-instead of your own bucket, replace it with `.remote(url, api_key)`: see
+instead of your own bucket, replace it with `.remote(url, api_key)`, or on devices you
+do not control `.remote_with_tokens(url, source)`: see
 [docs/hosted-api.md](docs/hosted-api.md).
 
 A second process follows the same database read-only:
@@ -98,7 +104,9 @@ db.sync().await?;                                 // pull what is new, any time
   `Options::local_fsync` to trade speed for that).
 - **Buffered writes can lose a conflict.** Conflicts are resolved per key by timestamp,
   last write wins. A buffered write that loses is reported through
-  `Database::take_events`; it is not applied and not silently dropped.
+  `Database::take_events`; it is not applied and not silently dropped. Where losing
+  an update matters, use a conditional sync write instead: buffered writes cannot be
+  conditional.
 - **A sync write needs the object store, and gives up after 10 seconds** (set
   `Options::sync_write_timeout`). It then fails with `UNAVAILABLE`. Reads and buffered
   writes never wait on the object store, so they keep working while it is unreachable.
@@ -131,7 +139,7 @@ db.sync().await?;                                 // pull what is new, any time
 | [Library components](docs/components.md) | The crates, and how reads, writes, conflicts, ownership and replicas work |
 | [Testing locally](docs/testing-locally.md) | Run the tests, try every feature by hand against an S3 emulator, look inside the bucket |
 | [Object format](docs/format.md) | Exactly what is stored in the object store |
-| [Hosted service](docs/hosted-api.md) | Connecting with a URL and an API key instead of your own object store, and the API the client speaks |
+| [Hosted service](docs/hosted-api.md) | Connecting with a URL and an API key or short-lived tokens instead of your own object store, and the API the client speaks |
 
 ## Command line
 

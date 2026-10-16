@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use valkvedge::{
     object_store, Database, DeviceId, Durability, Hlc, LeaseConfig, Op, OpKind, OpOutcome, Options,
-    OutboxEntry, RejectReason, ValkvEdge, WriteOutcome,
+    OutboxEntry, RejectReason, ValkvEdge, Version, WatchEvent, WriteOutcome,
 };
 use valkvedge_log::{read_manifest, read_segments, Layout, Segment, Store};
 
@@ -41,6 +41,11 @@ struct Server {
     readers: std::sync::Mutex<Vec<(String, u64)>>,
     /// The device named in each push.
     pushers: std::sync::Mutex<Vec<String>>,
+    /// Tokens the server accepts, and those it says have expired.
+    tokens: std::sync::Mutex<Vec<String>>,
+    expired: std::sync::Mutex<Vec<String>>,
+    /// The credential presented on each request.
+    presented: std::sync::Mutex<Vec<String>>,
 }
 
 type Shared = State<Arc<Server>>;
@@ -87,8 +92,18 @@ impl Server {
         let presented = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if presented != Some(API_KEY) {
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or_default()
+            .to_string();
+        self.presented.lock().unwrap().push(presented.clone());
+        if self.expired.lock().unwrap().contains(&presented) {
+            return Err(error(
+                StatusCode::UNAUTHORIZED,
+                "TOKEN_EXPIRED",
+                "this token has expired",
+            ));
+        }
+        if presented != API_KEY && !self.tokens.lock().unwrap().contains(&presented) {
             return Err(error(
                 StatusCode::UNAUTHORIZED,
                 "UNAUTHENTICATED",
@@ -133,8 +148,33 @@ async fn commit(
             OpKind::Delete => batch.delete(&decode(&op["key"])),
         };
     }
+    for condition in body["conditions"].as_array().cloned().unwrap_or_default() {
+        let key = decode(&condition["key"]);
+        match condition["version"].as_str() {
+            Some(version) => batch.if_version(&key, &version.parse::<Version>().unwrap()),
+            None => batch.if_absent(&key),
+        };
+    }
     match batch.commit_with(Durability::Sync).await {
-        Ok(commit) => Json(json!({ "lsn": commit.lsn })).into_response(),
+        Ok(commit) => {
+            let versions: Vec<String> = commit.versions.iter().map(Version::to_string).collect();
+            Json(json!({ "lsn": commit.lsn, "versions": versions })).into_response()
+        }
+        Err(valkvedge::ValkvEdgeError::ConditionFailed { key }) => {
+            let mut response = (
+                StatusCode::PRECONDITION_FAILED,
+                Json(json!({ "error": {
+                    "code": "CONDITION_FAILED",
+                    "message": "a key was not at the expected version",
+                    "key": B64.encode(&key),
+                } })),
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert("x-edgekv-error", "CONDITION_FAILED".parse().unwrap());
+            response
+        }
         Err(e) => library_error(e),
     }
 }
@@ -356,6 +396,9 @@ async fn service(dir: &tempfile::TempDir) -> Service {
         mode: AtomicU8::new(UP),
         readers: std::sync::Mutex::new(Vec::new()),
         pushers: std::sync::Mutex::new(Vec::new()),
+        tokens: std::sync::Mutex::new(Vec::new()),
+        expired: std::sync::Mutex::new(Vec::new()),
+        presented: std::sync::Mutex::new(Vec::new()),
     });
     let app = Router::new()
         .route("/v1/db/{db}/commit", post(commit))
@@ -778,4 +821,284 @@ async fn a_device_names_itself_when_it_reads_with_the_id_its_pushes_carry() {
         .0
         .clone();
     assert_eq!(last, pushers[0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conditional_write_on_a_stale_version_fails_and_the_copy_catches_up() {
+    let [sdir, adir, bdir] = dirs();
+    let service = service(&sdir).await;
+    let a = device(&adir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    let b = device(&bdir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+
+    let first = a.put(b"stock", b"10").await.unwrap();
+    assert_eq!(first.versions.len(), 1, "the service reports the version");
+    b.sync().await.unwrap();
+    let (_, seen) = b.get_versioned(b"stock").unwrap().unwrap();
+    assert_eq!(seen, first.versions[0], "both devices agree on the version");
+
+    // a writes; b still holds the old version.
+    let second = a.put(b"stock", b"9").await.unwrap();
+    let mut stale = b.batch();
+    stale.if_version(b"stock", &seen).put(b"stock", b"9");
+    let err = stale.commit().await.unwrap_err();
+    assert_eq!(err.code(), "CONDITION_FAILED");
+    assert!(
+        matches!(&err, valkvedge::ValkvEdgeError::ConditionFailed { key } if key == b"stock"),
+        "{err:?}"
+    );
+    // Nothing was written, and b now sees the value that won.
+    let (value, version) = b.get_versioned(b"stock").unwrap().unwrap();
+    assert_eq!((value.as_slice(), version), (&b"9"[..], second.versions[0]));
+
+    let mut fresh = b.batch();
+    fresh.if_version(b"stock", &version).put(b"stock", b"8");
+    fresh.commit().await.unwrap();
+    a.sync().await.unwrap();
+    assert_eq!(text(a.get(b"stock").unwrap()).as_deref(), Some("8"));
+
+    let mut create = a.batch();
+    create.if_absent(b"stock").put(b"stock", b"0");
+    assert_eq!(
+        create.commit().await.unwrap_err().code(),
+        "CONDITION_FAILED",
+        "the key exists"
+    );
+
+    let mut buffered = a.batch();
+    buffered.if_absent(b"other").put(b"other", b"x");
+    assert_eq!(
+        buffered
+            .commit_with(Durability::Buffered)
+            .await
+            .unwrap_err()
+            .code(),
+        "UNSUPPORTED",
+        "a buffered write cannot be conditional"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn devices_counting_at_once_through_the_service_lose_no_increment() {
+    let [sdir, adir, bdir] = dirs();
+    let service = service(&sdir).await;
+    let mut handles = Vec::new();
+    for dir in [&adir, &bdir] {
+        let db = device(dir, &service, API_KEY)
+            .database("app")
+            .open()
+            .await
+            .unwrap();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..10 {
+                db.update(b"counter", |current| {
+                    let n: u64 =
+                        current.map_or(0, |v| std::str::from_utf8(v).unwrap().parse().unwrap());
+                    Some((n + 1).to_string().into_bytes())
+                })
+                .await
+                .unwrap();
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.unwrap();
+    }
+    let on_service = service.server.kv.database("app").open().await.unwrap();
+    assert_eq!(
+        text(on_service.get(b"counter").unwrap()).as_deref(),
+        Some("20")
+    );
+}
+
+/// A token in the shape the client reads: only the `exp` claim matters to it.
+fn token_expiring_in(seconds: u64, n: usize) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = URL_SAFE_NO_PAD.encode(json!({ "exp": now + seconds, "n": n }).to_string());
+    format!("eyJhbGciOiJIUzI1NiJ9.{claims}.sig")
+}
+
+fn token_device(
+    dir: &tempfile::TempDir,
+    service: &Service,
+    issued: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    lifetime_secs: u64,
+) -> ValkvEdge {
+    let server = service.server.clone();
+    ValkvEdge::builder(dir.path())
+        .options(fast())
+        .remote_with_tokens(&service.url, move |database: String| {
+            let (issued, server) = (issued.clone(), server.clone());
+            async move {
+                let mut issued = issued.lock().unwrap();
+                let token = token_expiring_in(lifetime_secs, issued.len());
+                server.tokens.lock().unwrap().push(token.clone());
+                issued.push((database, token.clone()));
+                Ok(token)
+            }
+        })
+        .build()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_with_tokens_fetches_one_per_database_and_replaces_a_refused_one() {
+    let [sdir, adir] = dirs();
+    let service = service(&sdir).await;
+    let issued = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kv = token_device(&adir, &service, issued.clone(), 3600);
+    let db = kv.database("app").open().await.unwrap();
+    db.put(b"k", b"1").await.unwrap();
+    db.put(b"k", b"2").await.unwrap();
+    db.sync().await.unwrap();
+    {
+        let issued = issued.lock().unwrap();
+        assert_eq!(issued.len(), 1, "a token valid for an hour is reused");
+        assert_eq!(issued[0].0, "app", "the source is told which database");
+    }
+    assert!(
+        !service
+            .server
+            .presented
+            .lock()
+            .unwrap()
+            .contains(&API_KEY.to_string()),
+        "the device never holds the API key"
+    );
+
+    // The service stops accepting the token: the device gets a new one and
+    // the write goes through.
+    let first = issued.lock().unwrap()[0].1.clone();
+    service.server.expired.lock().unwrap().push(first.clone());
+    db.put(b"k", b"3").await.unwrap();
+    assert_eq!(issued.lock().unwrap().len(), 2);
+    assert_eq!(
+        service.server.presented.lock().unwrap().last().unwrap(),
+        &issued.lock().unwrap()[1].1
+    );
+
+    let other = kv.database("other").open().await.unwrap();
+    other.put(b"k", b"x").await.unwrap();
+    assert_eq!(
+        issued.lock().unwrap()[2].0,
+        "other",
+        "one token per database"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_close_to_expiry_is_replaced_before_it_is_used() {
+    let [sdir, adir] = dirs();
+    let service = service(&sdir).await;
+    let issued = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Thirty seconds left is inside the margin: never worth sending.
+    let db = token_device(&adir, &service, issued.clone(), 30)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    let before = service.server.presented.lock().unwrap().len();
+    db.put(b"k", b"1").await.unwrap();
+    db.put(b"k", b"2").await.unwrap();
+    let presented = service.server.presented.lock().unwrap()[before..].to_vec();
+    let mut distinct = presented.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert!(presented.len() >= 2);
+    assert_eq!(
+        distinct.len(),
+        presented.len(),
+        "no such token is sent twice"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watch_reports_what_another_device_wrote_once_it_arrives() {
+    let [sdir, adir, bdir] = dirs();
+    let service = service(&sdir).await;
+    let a = device(&adir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    let b = device(&bdir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    let mut watch = b.watch(b"chat/").unwrap();
+
+    a.put(b"chat/1", b"hello").await.unwrap();
+    a.put(b"other", b"ignored").await.unwrap();
+    a.delete(b"chat/1").await.unwrap();
+    assert!(
+        watch.try_next().unwrap().is_none(),
+        "nothing has arrived yet"
+    );
+    b.sync().await.unwrap();
+
+    // One pull applied all three frames; the value is read when delivered.
+    let event = tokio::time::timeout(Duration::from_secs(5), watch.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        event,
+        WatchEvent::Changed {
+            key: b"chat/1".to_vec(),
+            value: None
+        }
+    );
+    assert!(
+        watch.try_next().unwrap().is_none(),
+        "{:?}",
+        watch.try_next()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watch_is_told_to_reload_when_the_copy_is_rebuilt_from_a_snapshot() {
+    let [sdir, adir, bdir] = dirs();
+    let service = service(&sdir).await;
+    let a = device(&adir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    a.put(b"k", b"1").await.unwrap();
+    let b = device(&bdir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    let mut watch = b.watch(b"").unwrap();
+    a.put(b"k", b"2").await.unwrap();
+    service
+        .server
+        .kv
+        .database("app")
+        .open()
+        .await
+        .unwrap()
+        .compact()
+        .await
+        .unwrap();
+    b.sync().await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), watch.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event, WatchEvent::Reset);
+    assert_eq!(text(b.get(b"k").unwrap()).as_deref(), Some("2"));
 }
