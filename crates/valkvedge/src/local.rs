@@ -10,7 +10,20 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use valkvedge_log::types::{decode_ops, encode_ops, Dec};
 use valkvedge_log::{ChainPos, DeviceId, Error, Frame, Hlc, Lsn, Op, OpKind, Record, Result};
-use valkvedge_sync::{Change, OutboxEntry, StateStore};
+use valkvedge_sync::{Change, Condition, OutboxEntry, StateStore};
+
+/// What changed in what a reader sees, announced after each local write.
+#[derive(Debug)]
+pub(crate) enum Changed {
+    /// These keys may read differently now.
+    Keys(Vec<Vec<u8>>),
+    /// The whole copy was replaced from a snapshot: any key may have changed.
+    Reset,
+}
+
+/// Where a store announces its changes. It belongs to the database, not to
+/// one opening of its files, so subscribers outlive eviction.
+pub(crate) type ChangeFeed = tokio::sync::broadcast::Sender<std::sync::Arc<Changed>>;
 
 const POS: &[u8] = b"pos";
 const RESETTING: &[u8] = b"resetting";
@@ -40,6 +53,7 @@ pub(crate) struct LocalStore {
     persist: Option<PersistMode>,
     // Serializes read-modify-write sequences. Fjall itself is thread-safe.
     write: Mutex<()>,
+    feed: ChangeFeed,
 }
 
 fn encode_entry(tombstone: bool, hlc: &Hlc, value: &[u8]) -> Vec<u8> {
@@ -67,7 +81,12 @@ fn encode_pos(pos: &ChainPos) -> Vec<u8> {
 }
 
 impl LocalStore {
-    pub(crate) fn open(path: &Path, cache_bytes: u64, fsync: bool) -> Result<Self> {
+    pub(crate) fn open(
+        path: &Path,
+        cache_bytes: u64,
+        fsync: bool,
+        feed: ChangeFeed,
+    ) -> Result<Self> {
         std::fs::create_dir_all(path).map_err(Error::local)?;
         let db = fjall::Database::builder(path)
             .worker_threads(1)
@@ -86,12 +105,31 @@ impl LocalStore {
             overlay: ks("overlay")?,
             persist: fsync.then_some(PersistMode::SyncAll),
             write: Mutex::new(()),
+            feed,
             db,
         })
     }
 
     fn batch(&self) -> fjall::OwnedWriteBatch {
         self.db.batch().durability(self.persist)
+    }
+
+    /// True when something is watching, so the work of finding out what
+    /// changed is skipped otherwise.
+    fn watched(&self) -> bool {
+        self.feed.receiver_count() > 0
+    }
+
+    fn announce(&self, changed: Changed) {
+        if matches!(&changed, Changed::Keys(keys) if keys.is_empty()) {
+            return;
+        }
+        // Fails only when nobody is subscribed.
+        let _ = self.feed.send(std::sync::Arc::new(changed));
+    }
+
+    fn has_pending(&self, key: &[u8]) -> Result<bool> {
+        self.overlay.contains_key(key).map_err(local)
     }
 
     fn meta_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -170,6 +208,9 @@ impl LocalStore {
         batch.insert(&self.outbox, seq.to_be_bytes().to_vec(), encoded);
         self.put_outbox_stat(&mut batch, &stat);
         batch.commit().map_err(local)?;
+        if self.watched() {
+            self.announce(Changed::Keys(ops.iter().map(|op| op.key.clone()).collect()));
+        }
         Ok(seq)
     }
 
@@ -202,6 +243,8 @@ impl LocalStore {
         let _guard = self.write.lock().expect("write lock");
         let mut stat = self.outbox_stat()?;
         let mut batch = self.batch();
+        let watched = self.watched();
+        let mut changed = Vec::new();
         for entry in entries {
             let key = entry.seq.to_be_bytes();
             let Some(stored) = self.outbox.get(key).map_err(local)? else {
@@ -214,52 +257,85 @@ impl LocalStore {
                 if let Some(pending) = self.overlay.get(&op.key).map_err(local)? {
                     if pending.len() >= 8 && pending[..8] == entry.seq.to_le_bytes() {
                         batch.remove(&self.overlay, op.key.as_slice());
+                        // A write that won is now the replicated value, so
+                        // the key reads the same. One that lost reads as
+                        // the winner from here on.
+                        if watched {
+                            let (_, pending_hlc, _) = decode_entry(&pending[8..])?;
+                            if self.version_of(&op.key)? != Some(pending_hlc) {
+                                changed.push(op.key.clone());
+                            }
+                        }
                     }
                 }
             }
         }
         self.put_outbox_stat(&mut batch, &stat);
         batch.commit().map_err(local)?;
+        self.announce(Changed::Keys(changed));
         Ok(stat)
     }
 
-    /// Applies a batch directly, for databases with no remote log.
-    pub(crate) fn apply_local(&self, changes: Vec<Change>, hlc: impl Fn() -> Hlc) -> Result<Lsn> {
+    /// Applies a batch directly, for databases with no remote log, if every
+    /// condition holds. Returns its LSN and each change's timestamp.
+    pub(crate) fn apply_local(
+        &self,
+        changes: Vec<Change>,
+        conditions: &[Condition],
+        hlc: impl Fn() -> Hlc,
+    ) -> Result<(Lsn, Vec<Hlc>)> {
+        // Held from the check to the write, so the conditions still hold
+        // when the batch lands.
+        let _guard = self.write.lock().expect("write lock");
+        for condition in conditions {
+            if self.live_version(&condition.key)? != condition.version {
+                return Err(Error::ConditionFailed {
+                    key: condition.key.clone(),
+                });
+            }
+        }
         let mut pos = self.position()?;
         pos.applied_lsn += 1;
+        let ops: Vec<Op> = changes
+            .into_iter()
+            .map(|c| Op {
+                kind: c.kind,
+                key: c.key,
+                value: c.value,
+                hlc: hlc(),
+            })
+            .collect();
+        let stamps = ops.iter().map(|op| op.hlc).collect();
         let frame = Frame {
             lsn: pos.applied_lsn,
             commit_hlc: hlc(),
             origin: None,
-            ops: changes
-                .into_iter()
-                .map(|c| Op {
-                    kind: c.kind,
-                    key: c.key,
-                    value: c.value,
-                    hlc: hlc(),
-                })
-                .collect(),
+            ops,
         };
-        self.apply(&[frame], pos)?;
-        Ok(pos.applied_lsn)
+        self.apply_locked(&[frame], pos)?;
+        Ok((pos.applied_lsn, stamps))
     }
 
     /// The stored (possibly encrypted) value of `key`: a pending buffered
     /// write if there is one, otherwise the replicated value.
     pub(crate) fn get_stored(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.get_stored_versioned(key)?.map(|(value, _)| value))
+    }
+
+    /// [`LocalStore::get_stored`] with the timestamp of the value returned.
+    pub(crate) fn get_stored_versioned(&self, key: &[u8]) -> Result<Option<(Vec<u8>, Hlc)>> {
         if let Some(pending) = self.overlay.get(key).map_err(local)? {
             if pending.len() < 8 {
                 return Err(Error::corrupt("overlay entry"));
             }
-            let (tombstone, _, value) = decode_entry(&pending[8..])?;
-            return Ok((!tombstone).then(|| value.to_vec()));
+            let (tombstone, hlc, value) = decode_entry(&pending[8..])?;
+            return Ok((!tombstone).then(|| (value.to_vec(), hlc)));
         }
         match self.data.get(key).map_err(local)? {
             None => Ok(None),
             Some(stored) => {
-                let (tombstone, _, value) = decode_entry(&stored)?;
-                Ok((!tombstone).then(|| value.to_vec()))
+                let (tombstone, hlc, value) = decode_entry(&stored)?;
+                Ok((!tombstone).then(|| (value.to_vec(), hlc)))
             }
         }
     }
@@ -277,6 +353,40 @@ impl LocalStore {
 
     pub(crate) fn disk_bytes(&self) -> u64 {
         self.db.disk_space().unwrap_or(0)
+    }
+
+    /// [`StateStore::apply`] for a caller that holds the write lock.
+    fn apply_locked(&self, frames: &[Frame], pos: ChainPos) -> Result<()> {
+        let applied = self.position()?.applied_lsn;
+        let mut batch = self.batch();
+        let mut marks: HashMap<DeviceId, u64> = HashMap::new();
+        let watched = self.watched();
+        let mut changed = Vec::new();
+        for frame in frames.iter().filter(|f| f.lsn > applied) {
+            for op in &frame.ops {
+                let stored = encode_entry(op.kind == OpKind::Delete, &op.hlc, &op.value);
+                batch.insert(&self.data, op.key.as_slice(), stored);
+                // A pending buffered write hides the replicated value, so
+                // the key reads the same until that write settles.
+                if watched && !self.has_pending(&op.key)? {
+                    changed.push(op.key.clone());
+                }
+            }
+            if let Some(origin) = frame.origin {
+                let mark = match marks.get(&origin.device) {
+                    Some(m) => *m,
+                    None => self.watermark(&origin.device)?,
+                };
+                marks.insert(origin.device, mark.max(origin.last_seq));
+            }
+        }
+        for (device, seq) in marks {
+            batch.insert(&self.devices, device.0.to_vec(), seq.to_le_bytes().to_vec());
+        }
+        batch.insert(&self.meta, POS, encode_pos(&pos));
+        batch.commit().map_err(local)?;
+        self.announce(Changed::Keys(changed));
+        Ok(())
     }
 }
 
@@ -302,33 +412,23 @@ impl StateStore for LocalStore {
 
     fn apply(&self, frames: &[Frame], pos: ChainPos) -> Result<()> {
         let _guard = self.write.lock().expect("write lock");
-        let applied = self.position()?.applied_lsn;
-        let mut batch = self.batch();
-        let mut marks: HashMap<DeviceId, u64> = HashMap::new();
-        for frame in frames.iter().filter(|f| f.lsn > applied) {
-            for op in &frame.ops {
-                let stored = encode_entry(op.kind == OpKind::Delete, &op.hlc, &op.value);
-                batch.insert(&self.data, op.key.as_slice(), stored);
-            }
-            if let Some(origin) = frame.origin {
-                let mark = match marks.get(&origin.device) {
-                    Some(m) => *m,
-                    None => self.watermark(&origin.device)?,
-                };
-                marks.insert(origin.device, mark.max(origin.last_seq));
-            }
-        }
-        for (device, seq) in marks {
-            batch.insert(&self.devices, device.0.to_vec(), seq.to_le_bytes().to_vec());
-        }
-        batch.insert(&self.meta, POS, encode_pos(&pos));
-        batch.commit().map_err(local)
+        self.apply_locked(frames, pos)
     }
 
     fn version_of(&self, key: &[u8]) -> Result<Option<Hlc>> {
         match self.data.get(key).map_err(local)? {
             None => Ok(None),
             Some(stored) => Ok(Some(decode_entry(&stored)?.1)),
+        }
+    }
+
+    fn live_version(&self, key: &[u8]) -> Result<Option<Hlc>> {
+        match self.data.get(key).map_err(local)? {
+            None => Ok(None),
+            Some(stored) => {
+                let (tombstone, hlc, _) = decode_entry(&stored)?;
+                Ok((!tombstone).then_some(hlc))
+            }
         }
     }
 
@@ -379,7 +479,9 @@ impl StateStore for LocalStore {
         batch.insert(&self.meta, POS, encode_pos(&pos));
         batch.remove(&self.meta, RESETTING);
         batch.commit().map_err(local)?;
-        self.db.persist(PersistMode::SyncAll).map_err(local)
+        self.db.persist(PersistMode::SyncAll).map_err(local)?;
+        self.announce(Changed::Reset);
+        Ok(())
     }
 
     fn scan(&self, visit: &mut dyn FnMut(Record) -> Result<()>) -> Result<()> {
@@ -530,7 +632,13 @@ impl Iterator for Iter {
 mod tests {
     use super::*;
     fn store(dir: &tempfile::TempDir) -> LocalStore {
-        LocalStore::open(dir.path(), 8 * 1024 * 1024, false).unwrap()
+        LocalStore::open(
+            dir.path(),
+            8 * 1024 * 1024,
+            false,
+            tokio::sync::broadcast::channel(16).0,
+        )
+        .unwrap()
     }
 
     fn hlc(ms: u64) -> Hlc {

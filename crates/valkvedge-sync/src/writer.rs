@@ -50,6 +50,16 @@ pub struct Change {
     pub value: Vec<u8>,
 }
 
+/// A requirement on one key for [`Writer::commit_if`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Condition {
+    /// The key.
+    pub key: Vec<u8>,
+    /// The timestamp its live value must have, or `None` for "has no live
+    /// value": never written, or deleted.
+    pub version: Option<Hlc>,
+}
+
 /// One entry from a device's outbox: an atomic batch with its sequence number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxEntry {
@@ -186,14 +196,36 @@ impl<S: StateStore> Writer<S> {
     /// The writer stamps the operations itself, later than anything it has
     /// seen, so a sync write always wins over writes that preceded it.
     pub async fn commit(&self, changes: Vec<Change>) -> Result<Lsn> {
+        Ok(self.commit_if(changes, &[]).await?.0)
+    }
+
+    /// Commits one atomic batch if every condition holds. Returns its LSN
+    /// and the timestamp each change was stamped with, in order.
+    ///
+    /// The conditions are checked under the same lock that orders commits,
+    /// against state that already holds every earlier write, so nothing can
+    /// change a key between the check and the write. If any condition fails,
+    /// nothing is written and the error is `CONDITION_FAILED`.
+    pub async fn commit_if(
+        &self,
+        changes: Vec<Change>,
+        conditions: &[Condition],
+    ) -> Result<(Lsn, Vec<Hlc>)> {
         let mut guard = self.log.lock().await;
         let log = guard.as_mut().ok_or(Error::Fenced)?;
+        for condition in conditions {
+            if self.state.live_version(&condition.key)? != condition.version {
+                return Err(Error::ConditionFailed {
+                    key: condition.key.clone(),
+                });
+            }
+        }
         for change in &changes {
             if let Some(current) = self.state.version_of(&change.key)? {
                 self.clock.observe(&current);
             }
         }
-        let ops = changes
+        let ops: Vec<Op> = changes
             .into_iter()
             .map(|c| Op {
                 kind: c.kind,
@@ -202,13 +234,14 @@ impl<S: StateStore> Writer<S> {
                 hlc: self.clock.now(),
             })
             .collect();
+        let stamps = ops.iter().map(|op| op.hlc).collect();
         let frame = Frame {
             lsn: log.next_lsn(),
             commit_hlc: self.clock.now(),
             origin: None,
             ops,
         };
-        self.append(log, vec![frame]).await
+        Ok((self.append(log, vec![frame]).await?, stamps))
     }
 
     /// Applies entries from a device's outbox.

@@ -17,4 +17,4 @@ mod writer;
 
 pub use pull::{pull, remote_head, PullOutcome};
 pub use state::{MemState, StateStore};
-pub use writer::{Change, OpOutcome, OutboxEntry, PushReport, Writer, WriterConfig};
+pub use writer::{Change, Condition, OpOutcome, OutboxEntry, PushReport, Writer, WriterConfig};

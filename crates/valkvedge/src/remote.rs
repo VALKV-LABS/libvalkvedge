@@ -4,13 +4,16 @@
 //! The API is described in `docs/hosted-api.md`.
 
 use crate::local::LocalStore;
-use base64::engine::general_purpose::STANDARD as B64;
+use crate::{Auth, Version};
+use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
 use base64::Engine;
 use serde_json::{json, Value};
 use std::time::Duration;
 use valkvedge_log::format::decode_snapshot_part;
-use valkvedge_log::{ChainPos, DeviceId, Error, Frame, Lsn, OpKind, RejectReason, Result, Segment};
-use valkvedge_sync::{Change, OpOutcome, OutboxEntry, PushReport, StateStore};
+use valkvedge_log::{
+    now_ms, ChainPos, DeviceId, Error, Frame, Hlc, Lsn, OpKind, RejectReason, Result, Segment,
+};
+use valkvedge_sync::{Change, Condition, OpOutcome, OutboxEntry, PushReport, StateStore};
 
 /// Header carrying the error code of a failed request.
 const ERROR_CODE_HEADER: &str = "x-edgekv-error";
@@ -19,15 +22,31 @@ const ERROR_CODE_HEADER: &str = "x-edgekv-error";
 const DEVICE_HEADER: &str = "x-edgekv-device";
 /// How long a download (log page or snapshot part) may take.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// A token is replaced this long before it expires, so a request never
+/// carries one that runs out on the way.
+const TOKEN_MARGIN_MS: u64 = 60_000;
 
 pub(crate) struct Client {
     http: reqwest::Client,
     base: String,
-    api_key: String,
+    auth: Auth,
+    /// The database's name, which a token source is asked about.
+    database: String,
+    /// The token in use and when it expires (ms since the epoch, `u64::MAX`
+    /// if it does not say).
+    token: tokio::sync::Mutex<Option<(String, u64)>>,
     /// This installation's id for the database: the same one its pushes carry.
     device: DeviceId,
     /// Bound on a commit or a push.
     write_timeout: Duration,
+}
+
+/// When a token expires, read from its `exp` claim without checking the
+/// signature: only the service can do that, and only the timing is needed.
+fn token_expiry_ms(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let claims: Value = serde_json::from_slice(&B64URL.decode(payload).ok()?).ok()?;
+    claims["exp"].as_u64()?.checked_mul(1000)
 }
 
 /// What `GET /log` answered.
@@ -49,6 +68,7 @@ fn unavailable(what: &str, e: reqwest::Error) -> Error {
 fn known_code(code: &str) -> &'static str {
     const KNOWN: &[&str] = &[
         "UNAUTHENTICATED",
+        "TOKEN_EXPIRED",
         "FORBIDDEN",
         "ACCOUNT_SUSPENDED",
         "STORAGE_QUOTA_EXCEEDED",
@@ -80,6 +100,11 @@ fn service_error(status: reqwest::StatusCode, code: Option<String>, body: &[u8])
     let code = code.or_else(|| field("code")).unwrap_or_default();
     let message = field("message").unwrap_or_else(|| format!("the service answered {status}"));
     match code.as_str() {
+        "CONDITION_FAILED" => Error::ConditionFailed {
+            key: field("key")
+                .and_then(|key| B64.decode(key).ok())
+                .unwrap_or_default(),
+        },
         "NOT_FOUND" | "KEY_NOT_FOUND" => Error::NotFound(message),
         "UNAVAILABLE" => Error::Unavailable(message),
         "KEY_TOO_LARGE" => Error::KeyTooLarge {
@@ -110,7 +135,7 @@ fn kind_name(kind: OpKind) -> &'static str {
 impl Client {
     pub(crate) fn new(
         base_url: &str,
-        api_key: &str,
+        auth: Auth,
         database: &str,
         device: DeviceId,
         write_timeout: Duration,
@@ -122,10 +147,40 @@ impl Client {
         Ok(Client {
             http,
             base: format!("{}/v1/db/{database}", base_url.trim_end_matches('/')),
-            api_key: api_key.to_string(),
+            auth,
+            database: database.to_string(),
+            token: tokio::sync::Mutex::new(None),
             device,
             write_timeout,
         })
+    }
+
+    /// The credential for the next request: the API key, or a token that
+    /// is not about to expire, fetched from the token source if needed.
+    async fn credential(&self) -> Result<String> {
+        let source = match &self.auth {
+            Auth::ApiKey(key) => return Ok(key.clone()),
+            Auth::Tokens(source) => source,
+        };
+        let mut held = self.token.lock().await;
+        if let Some((token, expires)) = held.as_ref() {
+            if now_ms().saturating_add(TOKEN_MARGIN_MS) < *expires {
+                return Ok(token.clone());
+            }
+        }
+        let token = source.token(&self.database).await?;
+        let expires = token_expiry_ms(&token).unwrap_or(u64::MAX);
+        *held = Some((token.clone(), expires));
+        Ok(token)
+    }
+
+    /// Forgets a token the service refused, unless another request already
+    /// replaced it.
+    async fn forget_token(&self, refused: &str) {
+        let mut held = self.token.lock().await;
+        if held.as_ref().is_some_and(|(token, _)| token == refused) {
+            *held = None;
+        }
     }
 
     async fn send(
@@ -133,8 +188,34 @@ impl Client {
         request: reqwest::RequestBuilder,
         timeout: Duration,
     ) -> Result<reqwest::Response> {
+        // A refused token is replaced and the request sent once more. The
+        // bodies sent here are bytes in memory, so the request can be copied.
+        let retry = match self.auth {
+            Auth::Tokens(_) => request.try_clone(),
+            Auth::ApiKey(_) => None,
+        };
+        let credential = self.credential().await?;
+        match self.send_once(request, &credential, timeout).await {
+            Err(Error::Service { code, .. })
+                if matches!(code, "TOKEN_EXPIRED" | "UNAUTHENTICATED") && retry.is_some() =>
+            {
+                self.forget_token(&credential).await;
+                let credential = self.credential().await?;
+                let retry = retry.expect("checked above");
+                self.send_once(retry, &credential, timeout).await
+            }
+            other => other,
+        }
+    }
+
+    async fn send_once(
+        &self,
+        request: reqwest::RequestBuilder,
+        credential: &str,
+        timeout: Duration,
+    ) -> Result<reqwest::Response> {
         let response = request
-            .bearer_auth(&self.api_key)
+            .bearer_auth(credential)
             .timeout(timeout)
             .send()
             .await
@@ -161,8 +242,14 @@ impl Client {
         serde_json::from_slice(&bytes).map_err(|e| Error::corrupt(format!("service response: {e}")))
     }
 
-    /// One atomic sync write. Returns its LSN once the service has stored it.
-    pub(crate) async fn commit(&self, changes: &[Change]) -> Result<Lsn> {
+    /// One atomic sync write, applied only if every condition holds.
+    /// Returns its LSN once the service has stored it, and the version each
+    /// change was given (empty if the service does not say).
+    pub(crate) async fn commit(
+        &self,
+        changes: &[Change],
+        conditions: &[Condition],
+    ) -> Result<(Lsn, Vec<Hlc>)> {
         let ops: Vec<Value> = changes
             .iter()
             .map(|c| {
@@ -173,14 +260,32 @@ impl Client {
                 })
             })
             .collect();
-        let request = self
-            .http
-            .post(format!("{}/commit", self.base))
-            .json(&json!({ "ops": ops }));
+        let mut body = json!({ "ops": ops });
+        if !conditions.is_empty() {
+            body["conditions"] = conditions
+                .iter()
+                .map(|c| {
+                    json!({
+                        "key": B64.encode(&c.key),
+                        "version": c.version.map(|v| Version::from_hlc(v).to_string()),
+                    })
+                })
+                .collect();
+        }
+        let request = self.http.post(format!("{}/commit", self.base)).json(&body);
         let reply = self.json(request, self.write_timeout).await?;
-        reply["lsn"]
+        let lsn = reply["lsn"]
             .as_u64()
-            .ok_or_else(|| Error::corrupt("commit response has no lsn"))
+            .ok_or_else(|| Error::corrupt("commit response has no lsn"))?;
+        let mut stamps = Vec::new();
+        for version in reply["versions"].as_array().into_iter().flatten() {
+            let version: Version = version
+                .as_str()
+                .and_then(|text| text.parse().ok())
+                .ok_or_else(|| Error::corrupt("commit response has a malformed version"))?;
+            stamps.push(version.hlc());
+        }
+        Ok((lsn, stamps))
     }
 
     /// Hands outbox entries to the service. Safe to repeat.

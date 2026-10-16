@@ -105,6 +105,13 @@ pub enum Error {
     /// The requested feature is not available in this build or mode.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// A conditional write was not applied: a key it named was not at the
+    /// expected version. Nothing in the batch was written.
+    #[error("condition failed for key {:?}", String::from_utf8_lossy(key))]
+    ConditionFailed {
+        /// The first key whose condition did not hold.
+        key: Vec<u8>,
+    },
 }
 
 impl Error {
@@ -130,6 +137,7 @@ impl Error {
             Error::Rejected(RejectReason::StaleWrite) => "STALE_WRITE",
             Error::Service { code, .. } => code,
             Error::Unsupported(_) => "UNSUPPORTED",
+            Error::ConditionFailed { .. } => "CONDITION_FAILED",
         }
     }
 
