@@ -347,8 +347,8 @@ async fn namespaced_databases_have_their_own_prefix_and_replicate() {
 }
 
 #[tokio::test]
-async fn the_writer_accepts_pushed_entries_from_other_devices() {
-    use valkvedge::{DeviceId, Hlc, Op, OpKind, OpOutcome, OutboxEntry};
+async fn the_writer_accepts_pushed_entries_from_other_replicas() {
+    use valkvedge::{Hlc, Op, OpKind, OpOutcome, OutboxEntry, ReplicaId};
     let store = Arc::new(InMemory::new());
     let (wdir, rdir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let db = client(&wdir, &store, Role::Writer)
@@ -358,7 +358,7 @@ async fn the_writer_accepts_pushed_entries_from_other_devices() {
         .unwrap();
     db.put(b"title", b"from-writer").await.unwrap();
 
-    let phone = DeviceId([7; 16]);
+    let phone = ReplicaId([7; 16]);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -370,7 +370,7 @@ async fn the_writer_accepts_pushed_entries_from_other_devices() {
         hlc: Hlc {
             physical_ms: ms,
             counter: 0,
-            device: phone,
+            replica: phone,
         },
     };
     let entries = vec![OutboxEntry {
@@ -438,7 +438,7 @@ async fn a_buffered_write_made_after_a_sync_write_always_wins() {
 }
 
 #[tokio::test]
-async fn a_buffered_write_beats_a_newer_looking_value_this_device_already_holds() {
+async fn a_buffered_write_beats_a_newer_looking_value_this_replica_already_holds() {
     // The writer process restarts between the two writes, so each is stamped
     // by a fresh clock. The second must still be the later one.
     let store = Arc::new(InMemory::new());
@@ -485,7 +485,7 @@ async fn a_buffered_write_that_loses_a_conflict_is_reported() {
     later.put(b"title", b"final");
     later.commit_with(Durability::Sync).await.unwrap();
 
-    // Until the push settles it, the device still reads its own pending write.
+    // Until the push settles it, the replica still reads its own pending write.
     assert_eq!(text(db.get(b"title").unwrap()).as_deref(), Some("draft"));
     db.flush().await.unwrap();
     assert_eq!(text(db.get(b"title").unwrap()).as_deref(), Some("final"));

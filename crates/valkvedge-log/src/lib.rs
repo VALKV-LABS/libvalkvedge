@@ -30,4 +30,4 @@ pub use log::{
     SnapshotUpload,
 };
 pub use store::{PutOutcome, Store, Versioned};
-pub use types::{now_ms, DeviceId, Frame, Hlc, HlcClock, Lsn, Op, OpKind, Origin};
+pub use types::{now_ms, Frame, Hlc, HlcClock, Lsn, Op, OpKind, Origin, ReplicaId};

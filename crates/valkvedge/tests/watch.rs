@@ -4,7 +4,7 @@ use object_store::memory::InMemory;
 use std::sync::Arc;
 use std::time::Duration;
 use valkvedge::{
-    DeviceId, Durability, Hlc, LeaseConfig, Op, OpKind, Options, OutboxEntry, Role, ValkvEdge,
+    Durability, Hlc, LeaseConfig, Op, OpKind, Options, OutboxEntry, ReplicaId, Role, ValkvEdge,
     Watch, WatchEvent, WriteOutcome,
 };
 
@@ -178,9 +178,9 @@ async fn a_buffered_write_is_reported_at_once_and_again_only_if_it_loses() {
     assert_eq!(next(&mut watch).await, changed("won", Some("mine")));
     assert_eq!(next(&mut watch).await, changed("lost", Some("mine")));
 
-    // Another device's later write to `lost` reaches the writer first. While
-    // this device's own write is pending, `lost` still reads as it.
-    let other = DeviceId([7; 16]);
+    // Another replica's later write to `lost` reaches the writer first. While
+    // this replica's own write is pending, `lost` still reads as it.
+    let other = ReplicaId([7; 16]);
     let later = Op {
         kind: OpKind::Put,
         key: b"lost".to_vec(),
@@ -188,7 +188,7 @@ async fn a_buffered_write_is_reported_at_once_and_again_only_if_it_loses() {
         hlc: Hlc {
             physical_ms: now_ms() + 1000,
             counter: 0,
-            device: other,
+            replica: other,
         },
     };
     db.accept_push(

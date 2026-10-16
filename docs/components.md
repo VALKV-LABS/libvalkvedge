@@ -81,10 +81,10 @@ it on Fjall.
 
 ```mermaid
 flowchart LR
-    subgraph DEVICE["One database on local disk: {root}/{database}/"]
+    subgraph DISK["One database on local disk: {root}/{database}/"]
         DATA["data<br/>key → value, timestamp, deleted flag"]
-        META["meta<br/>log position, device id, key check"]
-        DEV["devices<br/>device → highest applied outbox entry"]
+        META["meta<br/>log position, replica id, key check"]
+        DEV["replicas<br/>replica → highest applied outbox entry"]
         OUT["outbox<br/>buffered batches not yet confirmed"]
         OVER["overlay<br/>latest pending write per key"]
     end
@@ -137,7 +137,7 @@ sequenceDiagram
     Db->>Db: one local batch: outbox entry + overlay
     Db-->>App: outbox sequence number
     Note over Db: later: every push_interval, at push_bytes, or on flush()
-    Db->>W: push(device, outbox entries)
+    Db->>W: push(replica, outbox entries)
     W->>W: per key, keep the newer timestamp
     W->>S: create-only PUT (one frame per entry)
     W->>Db: apply winning operations
@@ -173,20 +173,20 @@ It continues in the background, and a later write finds the session ready.
 ### Conflicts
 
 Every operation carries a hybrid logical clock timestamp: wall-clock milliseconds, a
-counter, and the device id. Sync writes are stamped by the writer at commit, later than
-anything it has seen. Buffered writes are stamped by the device when they are made.
+counter, and the replica id. Sync writes are stamped by the writer at commit, later than
+anything it has seen. Buffered writes are stamped by the replica when they are made.
 
 When the writer receives pushed operations it compares each one with what it holds for
 that key and keeps the newer. The log contains only winners; replicas apply it in order
 and never re-decide. The push result says, per operation, whether it was applied,
 superseded, or rejected:
 
-- stamped more than `max_clock_skew` in the future: rejected, so a device with a wrong
+- stamped more than `max_clock_skew` in the future: rejected, so a replica with a wrong
   clock cannot win every future conflict;
 - older than `tombstone_retention`: rejected, because the writer may no longer remember
   a delete it would need to compare against.
 
-The device's highest applied outbox entry (its *watermark*) is recorded in the log
+The replica's highest applied outbox entry (its *watermark*) is recorded in the log
 itself. A push that is retried, even against a different writer after a failover, is
 recognised and not applied twice.
 

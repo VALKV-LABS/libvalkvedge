@@ -3,7 +3,7 @@
 //! `docs/format.md`.
 
 use crate::error::{Error, Result};
-use crate::types::{put_bytes, Dec, DeviceId, Frame, Hlc, Lsn};
+use crate::types::{put_bytes, Dec, Frame, Hlc, Lsn, ReplicaId};
 use serde::{Deserialize, Serialize};
 
 /// Highest format version this build reads and the version it writes.
@@ -157,10 +157,10 @@ pub enum Record {
         /// True when the key was deleted.
         tombstone: bool,
     },
-    /// The highest outbox sequence number applied for a device.
+    /// The highest outbox sequence number applied for a replica.
     Watermark {
-        /// The device.
-        device: DeviceId,
+        /// The replica.
+        replica: ReplicaId,
         /// Highest applied outbox sequence number.
         seq: u64,
     },
@@ -182,9 +182,9 @@ impl Record {
                 put_bytes(out, key);
                 put_bytes(out, value);
             }
-            Record::Watermark { device, seq } => {
+            Record::Watermark { replica, seq } => {
                 out.push(1);
-                out.extend_from_slice(&device.0);
+                out.extend_from_slice(&replica.0);
                 out.extend_from_slice(&seq.to_le_bytes());
             }
         }
@@ -203,7 +203,7 @@ impl Record {
                 })
             }
             1 => Ok(Record::Watermark {
-                device: DeviceId(dec.array16()?),
+                replica: ReplicaId(dec.array16()?),
                 seq: dec.u64()?,
             }),
             other => Err(Error::corrupt(format!("unknown record tag {other}"))),
@@ -403,7 +403,7 @@ mod tests {
             commit_hlc: Hlc {
                 physical_ms: lsn,
                 counter: 0,
-                device: DeviceId([1; 16]),
+                replica: ReplicaId([1; 16]),
             },
             origin: None,
             ops: vec![Op {
@@ -470,7 +470,7 @@ mod tests {
                 tombstone: true,
             },
             Record::Watermark {
-                device: DeviceId([3; 16]),
+                replica: ReplicaId([3; 16]),
                 seq: 99,
             },
         ];

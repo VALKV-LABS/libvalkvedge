@@ -1,4 +1,4 @@
-//! The client side of the data API: how a device reaches a database that a
+//! The client side of the data API: how a replica reaches a database that a
 //! service, not this process, writes to the object store.
 //!
 //! The API is described in `docs/hosted-api.md`.
@@ -11,15 +11,15 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use valkvedge_log::format::decode_snapshot_part;
 use valkvedge_log::{
-    now_ms, ChainPos, DeviceId, Error, Frame, Hlc, Lsn, OpKind, RejectReason, Result, Segment,
+    now_ms, ChainPos, Error, Frame, Hlc, Lsn, OpKind, RejectReason, ReplicaId, Result, Segment,
 };
 use valkvedge_sync::{Change, Condition, OpOutcome, OutboxEntry, PushReport, StateStore};
 
 /// Header carrying the error code of a failed request.
 const ERROR_CODE_HEADER: &str = "x-edgekv-error";
-/// Header by which this device names itself when it reads, so the service can
-/// tell which devices follow a database and how far each has got.
-const DEVICE_HEADER: &str = "x-edgekv-device";
+/// Header by which this replica names itself when it reads, so the service can
+/// tell which replicas follow a database and how far each has got.
+const REPLICA_HEADER: &str = "x-edgekv-replica";
 /// How long a download (log page or snapshot part) may take.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// A token is replaced this long before it expires, so a request never
@@ -36,7 +36,7 @@ pub(crate) struct Client {
     /// if it does not say).
     token: tokio::sync::Mutex<Option<(String, u64)>>,
     /// This installation's id for the database: the same one its pushes carry.
-    device: DeviceId,
+    replica: ReplicaId,
     /// Bound on a commit or a push.
     write_timeout: Duration,
 }
@@ -137,7 +137,7 @@ impl Client {
         base_url: &str,
         auth: Auth,
         database: &str,
-        device: DeviceId,
+        replica: ReplicaId,
         write_timeout: Duration,
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
@@ -150,7 +150,7 @@ impl Client {
             auth,
             database: database.to_string(),
             token: tokio::sync::Mutex::new(None),
-            device,
+            replica,
             write_timeout,
         })
     }
@@ -291,7 +291,7 @@ impl Client {
     /// Hands outbox entries to the service. Safe to repeat.
     pub(crate) async fn push(
         &self,
-        device: DeviceId,
+        replica: ReplicaId,
         entries: &[OutboxEntry],
     ) -> Result<PushReport> {
         let body: Vec<Value> = entries
@@ -313,7 +313,7 @@ impl Client {
             })
             .collect();
         let request = self.http.post(format!("{}/push", self.base)).json(&json!({
-            "device_id": device.to_string(),
+            "replica_id": replica.to_string(),
             "entries": body,
         }));
         let reply = self.json(request, self.write_timeout).await?;
@@ -346,7 +346,7 @@ impl Client {
         let request = self
             .http
             .get(format!("{}/head", self.base))
-            .header(DEVICE_HEADER, self.device.to_string());
+            .header(REPLICA_HEADER, self.replica.to_string());
         let reply = self.json(request, self.write_timeout).await?;
         reply["lsn"]
             .as_u64()
@@ -354,12 +354,12 @@ impl Client {
     }
 
     async fn log(&self, after: Lsn) -> Result<LogPage> {
-        // `after` is how far this device has read: with the device header,
+        // `after` is how far this replica has read: with the replica header,
         // the service knows how far behind it is.
         let request = self
             .http
             .get(format!("{}/log?after={after}", self.base))
-            .header(DEVICE_HEADER, self.device.to_string());
+            .header(REPLICA_HEADER, self.replica.to_string());
         let response = match self.send(request, DOWNLOAD_TIMEOUT).await {
             Ok(response) => response,
             Err(Error::Service {

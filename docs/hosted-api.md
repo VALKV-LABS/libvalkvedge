@@ -1,7 +1,7 @@
 # Connecting to a hosted service
 
 Instead of giving the library an object store of your own, you can point it at a
-service that owns the object store for you. The device then needs no storage
+service that owns the object store for you. The replica then needs no storage
 credentials: only the service's URL and an API key.
 
 ```rust
@@ -19,8 +19,8 @@ Everything else is the same API. What changes is where things happen:
 | Sync write | This process appends to the log | The service appends; the write returns when it confirms, and the local copy has caught up to it |
 | Buffered write | Local outbox, pushed by this process | Local outbox, pushed to the service |
 | Conflicts | Resolved by this process | Resolved by the service; losers are reported through `take_events` the same way |
-| Following other devices | Reads the bucket | Asks the service for new frames |
-| First open on a new device | Downloads the snapshot from the bucket | Downloads it from the service |
+| Following other replicas | Reads the bucket | Asks the service for new frames |
+| First open on a new replica | Downloads the snapshot from the bucket | Downloads it from the service |
 | Works offline | Reads and buffered writes | Reads and buffered writes |
 
 Databases are addressed by the names they have in the service. Create them there first;
@@ -33,10 +33,10 @@ the next read sees the value that won. `Database::watch` reports changes as they
 arrive from the service, which with the background task running is about once per
 `pull_interval`.
 
-## Devices you do not control: tokens
+## Replicas you do not control: tokens
 
 An API key is for your servers. An app on a user's phone or in a browser should not
-carry one: anyone can take it out of the app. Give such devices short-lived tokens
+carry one: anyone can take it out of the app. Give such replicas short-lived tokens
 instead. Your backend keeps the API key, decides who the user is, and asks the service
 for a token that works for one database, read-only or read-write, for a limited time:
 
@@ -57,7 +57,7 @@ tokens. `ttl_seconds` is 60 to 86,400 (default 3,600). `subject` is optional and
 recorded in the token for your own reference. A token stops working when it expires
 or when the API key that minted it is revoked. A token cannot mint tokens.
 
-On the device, give the library a way to get tokens from your backend instead of a key:
+On the replica, give the library a way to get tokens from your backend instead of a key:
 
 ```rust
 let kv = ValkvEdge::builder(dir)
@@ -93,10 +93,10 @@ Every request is `Authorization: Bearer <api key or token>` under `/v1/db/{datab
 
 Keys and values travel base64-encoded in JSON bodies.
 
-**Which device is asking.** On `GET /head` and `GET /log` the library also sends
-`X-Edgekv-Device: <uuid>`: the id this installation has for the database, the same one
-its pushes carry as `device_id`. Together with `after`, it tells the service how far
-each device has read, so it can show which devices follow a database and how far
+**Which replica is asking.** On `GET /head` and `GET /log` the library also sends
+`X-Edgekv-Replica: <uuid>`: the id this installation has for the database, the same one
+its pushes carry as `replica_id`. Together with `after`, it tells the service how far
+each replica has read, so it can show which replicas follow a database and how far
 behind each is. The header is optional to a service that speaks this protocol; a
 request without it is answered the same way.
 
@@ -124,7 +124,7 @@ prints them.
 **Push**
 
 ```json
-{ "device_id": "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f",
+{ "replica_id": "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f",
   "entries": [
     { "seq": 7, "ops": [
       { "op": "put", "key": "YQ==", "value": "MQ==", "hlc": { "ms": 1791700000000, "counter": 0 } }
@@ -134,7 +134,7 @@ prints them.
 
 Each result is one of `applied`, `superseded`, `duplicate`, `clock_skew`,
 `stale_write`, in the order of the operations. A push is safe to repeat: entries at or
-below the device's watermark come back as `duplicate` and are not applied again.
+below the replica's watermark come back as `duplicate` and are not applied again.
 
 **Log.** A page may hold fewer frames than exist; the client asks again from the last
 LSN it applied until a page comes back empty. If the frames asked for now exist only
@@ -179,11 +179,11 @@ message.
   (10 seconds by default), then fails with `UNAVAILABLE`. As with any network write,
   the service may have stored it anyway; make sync writes safe to repeat.
 - **Encryption** works the same way: with `encryption_key`, values are sealed on the
-  device and the service only ever stores ciphertext. Key names are not encrypted. The
-  check that catches a wrong key before any read is kept on the device only in this
-  mode; a device opening with the wrong key finds out on its first read.
-- **One device, one outbox.** The device id that identifies a device's pushes is
+  replica and the service only ever stores ciphertext. Key names are not encrypted. The
+  check that catches a wrong key before any read is kept on the replica only in this
+  mode; a replica opening with the wrong key finds out on its first read.
+- **One replica, one outbox.** The replica id that identifies a replica's pushes is
   stored in its local directory. Copying that directory to another machine makes two
-  devices with the same id; do not do that.
+  replicas with the same id; do not do that.
 - **Not available in this mode:** `compact`, `take_over`, `owner`, `accept_push` and
   namespaces. They belong to a process that owns the object store.

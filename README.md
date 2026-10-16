@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Leave out `.object_store(...)` for a purely local database. To use a hosted service
-instead of your own bucket, replace it with `.remote(url, api_key)`, or on devices you
+instead of your own bucket, replace it with `.remote(url, api_key)`, or on replicas you
 do not control `.remote_with_tokens(url, source)`: see
 [docs/hosted-api.md](docs/hosted-api.md).
 
@@ -99,7 +99,7 @@ db.sync().await?;                                 // pull what is new, any time
 
 ## What you should know before relying on it
 
-- **Buffered writes can be lost** if the device is lost before they are uploaded, and
+- **Buffered writes can be lost** if the replica is lost before they are uploaded, and
   by default the last moments of them can be lost on power failure (set
   `Options::local_fsync` to trade speed for that).
 - **Buffered writes can lose a conflict.** Conflicts are resolved per key by timestamp,

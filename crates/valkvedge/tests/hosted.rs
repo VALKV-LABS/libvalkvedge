@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use valkvedge::{
-    object_store, Database, DeviceId, Durability, Hlc, LeaseConfig, Op, OpKind, OpOutcome, Options,
-    OutboxEntry, RejectReason, ValkvEdge, Version, WatchEvent, WriteOutcome,
+    object_store, Database, Durability, Hlc, LeaseConfig, Op, OpKind, OpOutcome, Options,
+    OutboxEntry, RejectReason, ReplicaId, ValkvEdge, Version, WatchEvent, WriteOutcome,
 };
 use valkvedge_log::{read_manifest, read_segments, Layout, Segment, Store};
 
@@ -37,9 +37,9 @@ struct Server {
     kv: ValkvEdge,
     store: Store,
     mode: AtomicU8,
-    /// The device named on each read of the log, and the position it read from.
+    /// The replica named on each read of the log, and the position it read from.
     readers: std::sync::Mutex<Vec<(String, u64)>>,
-    /// The device named in each push.
+    /// The replica named in each push.
     pushers: std::sync::Mutex<Vec<String>>,
     /// Tokens the server accepts, and those it says have expired.
     tokens: std::sync::Mutex<Vec<String>>,
@@ -189,18 +189,18 @@ async fn push(
         Ok(db) => db,
         Err(response) => return response,
     };
-    let hex: String = body["device_id"]
+    let hex: String = body["replica_id"]
         .as_str()
         .unwrap_or_default()
         .chars()
         .filter(|c| *c != '-')
         .collect();
-    let mut device = [0u8; 16];
-    for (i, byte) in device.iter_mut().enumerate() {
+    let mut replica = [0u8; 16];
+    for (i, byte) in replica.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
     }
-    let device = DeviceId(device);
-    server.pushers.lock().unwrap().push(device.to_string());
+    let replica = ReplicaId(replica);
+    server.pushers.lock().unwrap().push(replica.to_string());
     let entries = body["entries"]
         .as_array()
         .cloned()
@@ -219,13 +219,13 @@ async fn push(
                     hlc: Hlc {
                         physical_ms: op["hlc"]["ms"].as_u64().unwrap(),
                         counter: op["hlc"]["counter"].as_u64().unwrap_or(0) as u32,
-                        device,
+                        replica,
                     },
                 })
                 .collect(),
         })
         .collect();
-    let report = match db.accept_push(device, entries).await {
+    let report = match db.accept_push(replica, entries).await {
         Ok(report) => report,
         Err(e) => return library_error(e),
     };
@@ -270,12 +270,15 @@ async fn log(
         Err(response) => return response,
     };
     let after: u64 = query.get("after").and_then(|v| v.parse().ok()).unwrap_or(0);
-    if let Some(device) = headers.get("x-edgekv-device").and_then(|v| v.to_str().ok()) {
+    if let Some(replica) = headers
+        .get("x-edgekv-replica")
+        .and_then(|v| v.to_str().ok())
+    {
         server
             .readers
             .lock()
             .unwrap()
-            .push((device.to_string(), after));
+            .push((replica.to_string(), after));
     }
     let layout = Layout::new(db.object_prefix().unwrap());
     let mut frames = Vec::new();
@@ -414,7 +417,7 @@ async fn service(dir: &tempfile::TempDir) -> Service {
     Service { url, server }
 }
 
-fn device(dir: &tempfile::TempDir, service: &Service, key: &str) -> ValkvEdge {
+fn replica(dir: &tempfile::TempDir, service: &Service, key: &str) -> ValkvEdge {
     ValkvEdge::builder(dir.path())
         .options(fast())
         .remote(&service.url, key)
@@ -431,10 +434,10 @@ fn dirs<const N: usize>() -> [tempfile::TempDir; N] {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_sync_write_is_confirmed_by_the_service_and_other_devices_follow() {
+async fn a_sync_write_is_confirmed_by_the_service_and_other_replicas_follow() {
     let [sdir, adir, bdir] = dirs();
     let service = service(&sdir).await;
-    let a = device(&adir, &service, API_KEY)
+    let a = replica(&adir, &service, API_KEY)
         .database("app")
         .open()
         .await
@@ -448,8 +451,8 @@ async fn a_sync_write_is_confirmed_by_the_service_and_other_devices_follow() {
     );
     assert_eq!(a.status().unwrap().applied_lsn, 1);
 
-    // A second device with an empty directory downloads the database on open.
-    let b = device(&bdir, &service, API_KEY)
+    // A second replica with an empty directory downloads the database on open.
+    let b = replica(&bdir, &service, API_KEY)
         .database("app")
         .open()
         .await
@@ -481,7 +484,7 @@ async fn a_sync_write_is_confirmed_by_the_service_and_other_devices_follow() {
 async fn buffered_writes_work_while_the_service_is_unreachable_and_arrive_later() {
     let [sdir, adir, bdir] = dirs();
     let service = service(&sdir).await;
-    let a = device(&adir, &service, API_KEY)
+    let a = replica(&adir, &service, API_KEY)
         .database("app")
         .durability(Durability::Buffered)
         .open()
@@ -515,7 +518,7 @@ async fn buffered_writes_work_while_the_service_is_unreachable_and_arrive_later(
     assert_eq!(text(a.get(b"offline").unwrap()).as_deref(), Some("1"));
     assert!(a.take_events().is_empty());
 
-    let b = device(&bdir, &service, API_KEY)
+    let b = replica(&bdir, &service, API_KEY)
         .database("app")
         .open()
         .await
@@ -525,15 +528,15 @@ async fn buffered_writes_work_while_the_service_is_unreachable_and_arrive_later(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn two_devices_writing_the_same_key_offline_converge_and_the_loser_is_told() {
+async fn two_replicas_writing_the_same_key_offline_converge_and_the_loser_is_told() {
     let [sdir, adir, bdir] = dirs();
     let service = service(&sdir).await;
-    let a = device(&adir, &service, API_KEY)
+    let a = replica(&adir, &service, API_KEY)
         .database("app")
         .open()
         .await
         .unwrap();
-    let b = device(&bdir, &service, API_KEY)
+    let b = replica(&bdir, &service, API_KEY)
         .database("app")
         .open()
         .await
@@ -568,10 +571,10 @@ async fn two_devices_writing_the_same_key_offline_converge_and_the_loser_is_told
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_new_device_starts_from_the_snapshot_and_a_stale_one_catches_up_through_it() {
+async fn a_new_replica_starts_from_the_snapshot_and_a_stale_one_catches_up_through_it() {
     let [sdir, adir, bdir, cdir] = dirs();
     let service = service(&sdir).await;
-    let a = device(&adir, &service, API_KEY)
+    let a = replica(&adir, &service, API_KEY)
         .database("app")
         .open()
         .await
@@ -579,7 +582,7 @@ async fn a_new_device_starts_from_the_snapshot_and_a_stale_one_catches_up_throug
     a.put(b"early", b"1").await.unwrap();
 
     // b follows up to here, then falls behind.
-    let b = device(&bdir, &service, API_KEY)
+    let b = replica(&bdir, &service, API_KEY)
         .database("app")
         .open()
         .await
@@ -603,7 +606,7 @@ async fn a_new_device_starts_from_the_snapshot_and_a_stale_one_catches_up_throug
     a.put(b"after", b"compaction").await.unwrap();
 
     // c is brand new: snapshot, then the one frame after it.
-    let c = device(&cdir, &service, API_KEY)
+    let c = replica(&cdir, &service, API_KEY)
         .database("app")
         .open()
         .await
@@ -627,12 +630,12 @@ async fn a_new_device_starts_from_the_snapshot_and_a_stale_one_catches_up_throug
 async fn a_pending_buffered_write_survives_a_rebuild_from_the_snapshot() {
     let [sdir, adir, bdir] = dirs();
     let service = service(&sdir).await;
-    let a = device(&adir, &service, API_KEY)
+    let a = replica(&adir, &service, API_KEY)
         .database("app")
         .open()
         .await
         .unwrap();
-    let b = device(&bdir, &service, API_KEY)
+    let b = replica(&bdir, &service, API_KEY)
         .database("app")
         .open()
         .await
@@ -670,7 +673,7 @@ async fn service_refusals_are_reported_with_the_services_own_codes() {
     let [sdir, adir, bdir] = dirs();
     let service = service(&sdir).await;
 
-    let wrong = device(&adir, &service, "ekv_wrong")
+    let wrong = replica(&adir, &service, "ekv_wrong")
         .database("app")
         .open()
         .await;
@@ -680,7 +683,7 @@ async fn service_refusals_are_reported_with_the_services_own_codes() {
     assert_eq!(err.code(), "UNAUTHENTICATED");
     assert!(err.to_string().contains("API key"));
 
-    let db = device(&bdir, &service, API_KEY)
+    let db = replica(&bdir, &service, API_KEY)
         .database("app")
         .open()
         .await
@@ -701,7 +704,7 @@ async fn with_a_key_the_service_only_ever_sees_ciphertext() {
     let [sdir, adir, bdir, cdir] = dirs();
     let service = service(&sdir).await;
     let key = [5u8; 32];
-    let a = device(&adir, &service, API_KEY)
+    let a = replica(&adir, &service, API_KEY)
         .database("vault")
         .encryption_key(key)
         .open()
@@ -723,7 +726,7 @@ async fn with_a_key_the_service_only_ever_sees_ciphertext() {
         assert!(!stored.windows(9).any(|w| w == b"PLAINTEXT"));
     }
 
-    let b = device(&bdir, &service, API_KEY)
+    let b = replica(&bdir, &service, API_KEY)
         .database("vault")
         .encryption_key(key)
         .open()
@@ -734,7 +737,7 @@ async fn with_a_key_the_service_only_ever_sees_ciphertext() {
         Some("PLAINTEXT-737")
     );
 
-    let c = device(&cdir, &service, API_KEY)
+    let c = replica(&cdir, &service, API_KEY)
         .database("vault")
         .encryption_key([6u8; 32])
         .open()
@@ -756,10 +759,10 @@ async fn an_object_store_and_a_service_cannot_both_be_configured() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_device_names_itself_when_it_reads_with_the_id_its_pushes_carry() {
+async fn a_replica_names_itself_when_it_reads_with_the_id_its_pushes_carry() {
     let [sdir, adir, bdir] = dirs();
     let service = service(&sdir).await;
-    let a = device(&adir, &service, API_KEY)
+    let a = replica(&adir, &service, API_KEY)
         .database("app")
         .open()
         .await
@@ -767,7 +770,7 @@ async fn a_device_names_itself_when_it_reads_with_the_id_its_pushes_carry() {
     for i in 0..5u8 {
         a.put(&[b'k', i], b"v").await.unwrap();
     }
-    let b = device(&bdir, &service, API_KEY)
+    let b = replica(&bdir, &service, API_KEY)
         .database("app")
         .open()
         .await
@@ -775,22 +778,25 @@ async fn a_device_names_itself_when_it_reads_with_the_id_its_pushes_carry() {
     assert_eq!(b.sync().await.unwrap(), 5);
 
     let readers = service.server.readers.lock().unwrap().clone();
-    let mut devices: Vec<&str> = readers.iter().map(|(device, _)| device.as_str()).collect();
-    devices.sort_unstable();
-    devices.dedup();
-    assert_eq!(devices.len(), 2, "two devices, two ids: {readers:?}");
-    for device in &devices {
-        assert_eq!(device.len(), 36, "a UUID in its usual form: {device}");
+    let mut replicas: Vec<&str> = readers
+        .iter()
+        .map(|(replica, _)| replica.as_str())
+        .collect();
+    replicas.sort_unstable();
+    replicas.dedup();
+    assert_eq!(replicas.len(), 2, "two replicas, two ids: {readers:?}");
+    for replica in &replicas {
+        assert_eq!(replica.len(), 36, "a UUID in its usual form: {replica}");
     }
-    // Each read says how far that device already is, so the last thing each
+    // Each read says how far that replica already is, so the last thing each
     // one said is that it has everything.
-    for device in &devices {
-        let last = readers.iter().rev().find(|(d, _)| d == device).unwrap().1;
-        assert_eq!(last, 5, "{device} ended at the head");
+    for replica in &replicas {
+        let last = readers.iter().rev().find(|(d, _)| d == replica).unwrap().1;
+        assert_eq!(last, 5, "{replica} ended at the head");
     }
 
-    // A buffered write is pushed under the same id the device reads with.
-    let before: Vec<String> = readers.iter().map(|(device, _)| device.clone()).collect();
+    // A buffered write is pushed under the same id the replica reads with.
+    let before: Vec<String> = readers.iter().map(|(replica, _)| replica.clone()).collect();
     let mut batch = b.batch();
     batch.put(b"buffered", b"x");
     batch.commit_with(Durability::Buffered).await.unwrap();
@@ -805,7 +811,7 @@ async fn a_device_names_itself_when_it_reads_with_the_id_its_pushes_carry() {
 
     // Reopening the same directory keeps the id.
     drop(b);
-    let again = device(&bdir, &service, API_KEY)
+    let again = replica(&bdir, &service, API_KEY)
         .database("app")
         .open()
         .await
@@ -827,12 +833,12 @@ async fn a_device_names_itself_when_it_reads_with_the_id_its_pushes_carry() {
 async fn a_conditional_write_on_a_stale_version_fails_and_the_copy_catches_up() {
     let [sdir, adir, bdir] = dirs();
     let service = service(&sdir).await;
-    let a = device(&adir, &service, API_KEY)
+    let a = replica(&adir, &service, API_KEY)
         .database("app")
         .open()
         .await
         .unwrap();
-    let b = device(&bdir, &service, API_KEY)
+    let b = replica(&bdir, &service, API_KEY)
         .database("app")
         .open()
         .await
@@ -842,7 +848,10 @@ async fn a_conditional_write_on_a_stale_version_fails_and_the_copy_catches_up() 
     assert_eq!(first.versions.len(), 1, "the service reports the version");
     b.sync().await.unwrap();
     let (_, seen) = b.get_versioned(b"stock").unwrap().unwrap();
-    assert_eq!(seen, first.versions[0], "both devices agree on the version");
+    assert_eq!(
+        seen, first.versions[0],
+        "both replicas agree on the version"
+    );
 
     // a writes; b still holds the old version.
     let second = a.put(b"stock", b"9").await.unwrap();
@@ -886,12 +895,12 @@ async fn a_conditional_write_on_a_stale_version_fails_and_the_copy_catches_up() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn devices_counting_at_once_through_the_service_lose_no_increment() {
+async fn replicas_counting_at_once_through_the_service_lose_no_increment() {
     let [sdir, adir, bdir] = dirs();
     let service = service(&sdir).await;
     let mut handles = Vec::new();
     for dir in [&adir, &bdir] {
-        let db = device(dir, &service, API_KEY)
+        let db = replica(dir, &service, API_KEY)
             .database("app")
             .open()
             .await
@@ -929,7 +938,7 @@ fn token_expiring_in(seconds: u64, n: usize) -> String {
     format!("eyJhbGciOiJIUzI1NiJ9.{claims}.sig")
 }
 
-fn token_device(
+fn token_replica(
     dir: &tempfile::TempDir,
     service: &Service,
     issued: Arc<std::sync::Mutex<Vec<(String, String)>>>,
@@ -953,11 +962,11 @@ fn token_device(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_device_with_tokens_fetches_one_per_database_and_replaces_a_refused_one() {
+async fn a_replica_with_tokens_fetches_one_per_database_and_replaces_a_refused_one() {
     let [sdir, adir] = dirs();
     let service = service(&sdir).await;
     let issued = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let kv = token_device(&adir, &service, issued.clone(), 3600);
+    let kv = token_replica(&adir, &service, issued.clone(), 3600);
     let db = kv.database("app").open().await.unwrap();
     db.put(b"k", b"1").await.unwrap();
     db.put(b"k", b"2").await.unwrap();
@@ -974,10 +983,10 @@ async fn a_device_with_tokens_fetches_one_per_database_and_replaces_a_refused_on
             .lock()
             .unwrap()
             .contains(&API_KEY.to_string()),
-        "the device never holds the API key"
+        "the replica never holds the API key"
     );
 
-    // The service stops accepting the token: the device gets a new one and
+    // The service stops accepting the token: the replica gets a new one and
     // the write goes through.
     let first = issued.lock().unwrap()[0].1.clone();
     service.server.expired.lock().unwrap().push(first.clone());
@@ -1003,7 +1012,7 @@ async fn a_token_close_to_expiry_is_replaced_before_it_is_used() {
     let service = service(&sdir).await;
     let issued = Arc::new(std::sync::Mutex::new(Vec::new()));
     // Thirty seconds left is inside the margin: never worth sending.
-    let db = token_device(&adir, &service, issued.clone(), 30)
+    let db = token_replica(&adir, &service, issued.clone(), 30)
         .database("app")
         .open()
         .await
@@ -1024,15 +1033,15 @@ async fn a_token_close_to_expiry_is_replaced_before_it_is_used() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_watch_reports_what_another_device_wrote_once_it_arrives() {
+async fn a_watch_reports_what_another_replica_wrote_once_it_arrives() {
     let [sdir, adir, bdir] = dirs();
     let service = service(&sdir).await;
-    let a = device(&adir, &service, API_KEY)
+    let a = replica(&adir, &service, API_KEY)
         .database("app")
         .open()
         .await
         .unwrap();
-    let b = device(&bdir, &service, API_KEY)
+    let b = replica(&bdir, &service, API_KEY)
         .database("app")
         .open()
         .await
@@ -1071,13 +1080,13 @@ async fn a_watch_reports_what_another_device_wrote_once_it_arrives() {
 async fn a_watch_is_told_to_reload_when_the_copy_is_rebuilt_from_a_snapshot() {
     let [sdir, adir, bdir] = dirs();
     let service = service(&sdir).await;
-    let a = device(&adir, &service, API_KEY)
+    let a = replica(&adir, &service, API_KEY)
         .database("app")
         .open()
         .await
         .unwrap();
     a.put(b"k", b"1").await.unwrap();
-    let b = device(&bdir, &service, API_KEY)
+    let b = replica(&bdir, &service, API_KEY)
         .database("app")
         .open()
         .await

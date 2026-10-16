@@ -9,7 +9,7 @@ use std::ops::Bound;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use valkvedge_log::types::{decode_ops, encode_ops, Dec};
-use valkvedge_log::{ChainPos, DeviceId, Error, Frame, Hlc, Lsn, Op, OpKind, Record, Result};
+use valkvedge_log::{ChainPos, Error, Frame, Hlc, Lsn, Op, OpKind, Record, ReplicaId, Result};
 use valkvedge_sync::{Change, Condition, OutboxEntry, StateStore};
 
 /// What changed in what a reader sees, announced after each local write.
@@ -27,7 +27,8 @@ pub(crate) type ChangeFeed = tokio::sync::broadcast::Sender<std::sync::Arc<Chang
 
 const POS: &[u8] = b"pos";
 const RESETTING: &[u8] = b"resetting";
-const DEVICE: &[u8] = b"device";
+// Stored under its old name, so that an existing copy keeps its id.
+const REPLICA_ID: &[u8] = b"device";
 const OUTBOX_STAT: &[u8] = b"outbox";
 const ENC_CHECK: &[u8] = b"enc";
 
@@ -47,7 +48,7 @@ pub(crate) struct LocalStore {
     db: fjall::Database,
     data: Keyspace,
     meta: Keyspace,
-    devices: Keyspace,
+    replicas: Keyspace,
     outbox: Keyspace,
     overlay: Keyspace,
     persist: Option<PersistMode>,
@@ -100,7 +101,8 @@ impl LocalStore {
         Ok(LocalStore {
             data: ks("data")?,
             meta: ks("meta")?,
-            devices: ks("devices")?,
+            // Named "devices" on disk, from before replicas were called replicas.
+            replicas: ks("devices")?,
             outbox: ks("outbox")?,
             overlay: ks("overlay")?,
             persist: fsync.then_some(PersistMode::SyncAll),
@@ -137,17 +139,17 @@ impl LocalStore {
     }
 
     /// This installation's id for this database, created on first use.
-    pub(crate) fn device_id(&self) -> Result<DeviceId> {
+    pub(crate) fn replica_id(&self) -> Result<ReplicaId> {
         let _guard = self.write.lock().expect("write lock");
-        if let Some(bytes) = self.meta_get(DEVICE)? {
+        if let Some(bytes) = self.meta_get(REPLICA_ID)? {
             let id: [u8; 16] = bytes
                 .as_slice()
                 .try_into()
-                .map_err(|_| Error::corrupt("device id"))?;
-            return Ok(DeviceId(id));
+                .map_err(|_| Error::corrupt("replica id"))?;
+            return Ok(ReplicaId(id));
         }
-        let id = DeviceId::random();
-        self.meta.insert(DEVICE, id.0.to_vec()).map_err(local)?;
+        let id = ReplicaId::random();
+        self.meta.insert(REPLICA_ID, id.0.to_vec()).map_err(local)?;
         Ok(id)
     }
 
@@ -359,7 +361,7 @@ impl LocalStore {
     fn apply_locked(&self, frames: &[Frame], pos: ChainPos) -> Result<()> {
         let applied = self.position()?.applied_lsn;
         let mut batch = self.batch();
-        let mut marks: HashMap<DeviceId, u64> = HashMap::new();
+        let mut marks: HashMap<ReplicaId, u64> = HashMap::new();
         let watched = self.watched();
         let mut changed = Vec::new();
         for frame in frames.iter().filter(|f| f.lsn > applied) {
@@ -373,15 +375,19 @@ impl LocalStore {
                 }
             }
             if let Some(origin) = frame.origin {
-                let mark = match marks.get(&origin.device) {
+                let mark = match marks.get(&origin.replica) {
                     Some(m) => *m,
-                    None => self.watermark(&origin.device)?,
+                    None => self.watermark(&origin.replica)?,
                 };
-                marks.insert(origin.device, mark.max(origin.last_seq));
+                marks.insert(origin.replica, mark.max(origin.last_seq));
             }
         }
-        for (device, seq) in marks {
-            batch.insert(&self.devices, device.0.to_vec(), seq.to_le_bytes().to_vec());
+        for (replica, seq) in marks {
+            batch.insert(
+                &self.replicas,
+                replica.0.to_vec(),
+                seq.to_le_bytes().to_vec(),
+            );
         }
         batch.insert(&self.meta, POS, encode_pos(&pos));
         batch.commit().map_err(local)?;
@@ -432,8 +438,8 @@ impl StateStore for LocalStore {
         }
     }
 
-    fn watermark(&self, device: &DeviceId) -> Result<u64> {
-        match self.devices.get(device.0).map_err(local)? {
+    fn watermark(&self, replica: &ReplicaId) -> Result<u64> {
+        match self.replicas.get(replica.0).map_err(local)? {
             None => Ok(0),
             Some(v) => Ok(u64::from_le_bytes(
                 v.as_ref()
@@ -448,7 +454,7 @@ impl StateStore for LocalStore {
         self.meta.insert(RESETTING, [1u8]).map_err(local)?;
         self.db.persist(PersistMode::SyncAll).map_err(local)?;
         self.data.clear().map_err(local)?;
-        self.devices.clear().map_err(local)
+        self.replicas.clear().map_err(local)
     }
 
     fn load(&self, records: &[Record]) -> Result<()> {
@@ -465,9 +471,11 @@ impl StateStore for LocalStore {
                     key.as_slice(),
                     encode_entry(*tombstone, hlc, value),
                 ),
-                Record::Watermark { device, seq } => {
-                    batch.insert(&self.devices, device.0.to_vec(), seq.to_le_bytes().to_vec())
-                }
+                Record::Watermark { replica, seq } => batch.insert(
+                    &self.replicas,
+                    replica.0.to_vec(),
+                    seq.to_le_bytes().to_vec(),
+                ),
             }
         }
         batch.commit().map_err(local)
@@ -495,13 +503,13 @@ impl StateStore for LocalStore {
                 tombstone,
             })?;
         }
-        for guard in self.devices.iter() {
+        for guard in self.replicas.iter() {
             let (key, value) = guard.into_inner().map_err(local)?;
             visit(Record::Watermark {
-                device: DeviceId(
+                replica: ReplicaId(
                     key.as_ref()
                         .try_into()
-                        .map_err(|_| Error::corrupt("device key"))?,
+                        .map_err(|_| Error::corrupt("replica key"))?,
                 ),
                 seq: u64::from_le_bytes(
                     value
@@ -645,7 +653,7 @@ mod tests {
         Hlc {
             physical_ms: ms,
             counter: 0,
-            device: DeviceId([7; 16]),
+            replica: ReplicaId([7; 16]),
         }
     }
 
@@ -699,7 +707,7 @@ mod tests {
                 tombstone: true,
             },
             Record::Watermark {
-                device: DeviceId([3; 16]),
+                replica: ReplicaId([3; 16]),
                 seq: 42,
             },
         ];
@@ -717,11 +725,11 @@ mod tests {
         assert_eq!(read(&store, "d").as_deref(), Some("4"));
         assert_eq!(read(&store, "e"), None, "a tombstone reads as absent");
         assert_eq!(store.version_of(b"e").unwrap(), Some(hlc(9)));
-        assert_eq!(store.watermark(&DeviceId([3; 16])).unwrap(), 42);
+        assert_eq!(store.watermark(&ReplicaId([3; 16])).unwrap(), 42);
         let mut expected = first;
         expected.extend(second);
         assert_eq!(all(&store), expected);
-        // A loaded snapshot is the only copy this device has of that data:
+        // A loaded snapshot is the only copy this replica has of that data:
         // it must still be there, complete, after a restart.
         drop(store);
         let reopened = self::store(&dir);

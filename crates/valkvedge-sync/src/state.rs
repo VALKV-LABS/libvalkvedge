@@ -3,10 +3,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
-use valkvedge_log::{ChainPos, DeviceId, Frame, Hlc, OpKind, Record, Result};
+use valkvedge_log::{ChainPos, Frame, Hlc, OpKind, Record, ReplicaId, Result};
 
 /// The materialized state of one database: every key's latest value and
-/// timestamp, the per-device push watermarks, and the log position that state
+/// timestamp, the per-replica push watermarks, and the log position that state
 /// corresponds to.
 ///
 /// Implementations must make [`StateStore::apply`] atomic: after a crash the
@@ -31,8 +31,8 @@ pub trait StateStore: Send + Sync + 'static {
     /// checked against this.
     fn live_version(&self, key: &[u8]) -> Result<Option<Hlc>>;
 
-    /// Highest outbox sequence number applied for `device`, 0 if none.
-    fn watermark(&self, device: &DeviceId) -> Result<u64>;
+    /// Highest outbox sequence number applied for `replica`, 0 if none.
+    fn watermark(&self, replica: &ReplicaId) -> Result<u64>;
 
     /// Discards all replicated state and marks a snapshot load as in progress.
     fn begin_reset(&self) -> Result<()>;
@@ -58,7 +58,7 @@ struct MemInner {
     pos: ChainPos,
     resetting: bool,
     data: BTreeMap<Vec<u8>, (Vec<u8>, Hlc, bool)>,
-    watermarks: HashMap<DeviceId, u64>,
+    watermarks: HashMap<ReplicaId, u64>,
 }
 
 /// An in-memory [`StateStore`], for tests and examples.
@@ -110,7 +110,7 @@ impl StateStore for MemState {
                     .insert(op.key.clone(), (op.value.clone(), op.hlc, tombstone));
             }
             if let Some(origin) = frame.origin {
-                let mark = inner.watermarks.entry(origin.device).or_insert(0);
+                let mark = inner.watermarks.entry(origin.replica).or_insert(0);
                 *mark = (*mark).max(origin.last_seq);
             }
         }
@@ -131,9 +131,9 @@ impl StateStore for MemState {
         })
     }
 
-    fn watermark(&self, device: &DeviceId) -> Result<u64> {
+    fn watermark(&self, replica: &ReplicaId) -> Result<u64> {
         let inner = self.inner.lock().expect("mem state lock");
-        Ok(inner.watermarks.get(device).copied().unwrap_or(0))
+        Ok(inner.watermarks.get(replica).copied().unwrap_or(0))
     }
 
     fn begin_reset(&self) -> Result<()> {
@@ -159,8 +159,8 @@ impl StateStore for MemState {
                         .data
                         .insert(key.clone(), (value.clone(), *hlc, *tombstone));
                 }
-                Record::Watermark { device, seq } => {
-                    inner.watermarks.insert(*device, *seq);
+                Record::Watermark { replica, seq } => {
+                    inner.watermarks.insert(*replica, *seq);
                 }
             }
         }
@@ -187,8 +187,8 @@ impl StateStore for MemState {
                 tombstone,
             })?;
         }
-        for (device, seq) in marks {
-            visit(Record::Watermark { device, seq })?;
+        for (replica, seq) in marks {
+            visit(Record::Watermark { replica, seq })?;
         }
         Ok(())
     }

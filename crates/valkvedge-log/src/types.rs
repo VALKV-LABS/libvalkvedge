@@ -12,16 +12,16 @@ pub type Lsn = u64;
 
 /// Identifies one installation of the library.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct DeviceId(pub [u8; 16]);
+pub struct ReplicaId(pub [u8; 16]);
 
-impl DeviceId {
-    /// Generates a random device id.
+impl ReplicaId {
+    /// Generates a random replica id.
     pub fn random() -> Self {
-        DeviceId(*uuid::Uuid::new_v4().as_bytes())
+        ReplicaId(*uuid::Uuid::new_v4().as_bytes())
     }
 }
 
-impl std::fmt::Display for DeviceId {
+impl std::fmt::Display for ReplicaId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", uuid::Uuid::from_bytes(self.0))
     }
@@ -29,16 +29,16 @@ impl std::fmt::Display for DeviceId {
 
 /// Hybrid logical clock timestamp.
 ///
-/// Ordered by physical time, then counter, then device id, so two different
-/// devices can never produce equal timestamps.
+/// Ordered by physical time, then counter, then replica id, so two different
+/// replicas can never produce equal timestamps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Hlc {
     /// Milliseconds since the Unix epoch.
     pub physical_ms: u64,
     /// Tie-breaker for events in the same millisecond.
     pub counter: u32,
-    /// The device that produced the timestamp.
-    pub device: DeviceId,
+    /// The replica that produced the timestamp.
+    pub replica: ReplicaId,
 }
 
 impl Hlc {
@@ -49,7 +49,7 @@ impl Hlc {
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.physical_ms.to_le_bytes());
         out.extend_from_slice(&self.counter.to_le_bytes());
-        out.extend_from_slice(&self.device.0);
+        out.extend_from_slice(&self.replica.0);
     }
 
     /// Reads one timestamp from `dec`.
@@ -57,7 +57,7 @@ impl Hlc {
         Ok(Hlc {
             physical_ms: dec.u64()?,
             counter: dec.u32()?,
-            device: DeviceId(dec.array16()?),
+            replica: ReplicaId(dec.array16()?),
         })
     }
 }
@@ -70,25 +70,25 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Produces strictly increasing [`Hlc`] timestamps for one device.
+/// Produces strictly increasing [`Hlc`] timestamps for one replica.
 #[derive(Debug)]
 pub struct HlcClock {
-    device: DeviceId,
+    replica: ReplicaId,
     last: Mutex<(u64, u32)>,
 }
 
 impl HlcClock {
-    /// Creates a clock for `device`.
-    pub fn new(device: DeviceId) -> Self {
+    /// Creates a clock for `replica`.
+    pub fn new(replica: ReplicaId) -> Self {
         HlcClock {
-            device,
+            replica,
             last: Mutex::new((0, 0)),
         }
     }
 
-    /// The device this clock stamps for.
-    pub fn device(&self) -> DeviceId {
-        self.device
+    /// The replica this clock stamps for.
+    pub fn replica(&self) -> ReplicaId {
+        self.replica
     }
 
     /// Returns a timestamp greater than every one returned or observed before.
@@ -103,7 +103,7 @@ impl HlcClock {
         Hlc {
             physical_ms: last.0,
             counter: last.1,
-            device: self.device,
+            replica: self.replica,
         }
     }
 
@@ -192,11 +192,11 @@ pub fn decode_ops(bytes: &[u8]) -> Result<Vec<Op>> {
     Ok(ops)
 }
 
-/// Where a frame's operations came from, when they came from a device outbox.
+/// Where a frame's operations came from, when they came from a replica outbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Origin {
-    /// The pushing device.
-    pub device: DeviceId,
+    /// The pushing replica.
+    pub replica: ReplicaId,
     /// First outbox sequence number covered by the frame.
     pub first_seq: u64,
     /// Last outbox sequence number covered by the frame.
@@ -210,7 +210,7 @@ pub struct Frame {
     pub lsn: Lsn,
     /// When the writer committed the frame.
     pub commit_hlc: Hlc,
-    /// Set for frames built from a device's outbox.
+    /// Set for frames built from a replica's outbox.
     pub origin: Option<Origin>,
     /// The operations. May be empty (a frame can exist only to record `origin`).
     pub ops: Vec<Op>,
@@ -225,7 +225,7 @@ impl Frame {
             None => out.push(0),
             Some(o) => {
                 out.push(1);
-                out.extend_from_slice(&o.device.0);
+                out.extend_from_slice(&o.replica.0);
                 out.extend_from_slice(&o.first_seq.to_le_bytes());
                 out.extend_from_slice(&o.last_seq.to_le_bytes());
             }
@@ -243,7 +243,7 @@ impl Frame {
         let origin = match dec.u8()? {
             0 => None,
             1 => Some(Origin {
-                device: DeviceId(dec.array16()?),
+                replica: ReplicaId(dec.array16()?),
                 first_seq: dec.u64()?,
                 last_seq: dec.u64()?,
             }),
@@ -342,12 +342,12 @@ mod tests {
         Hlc {
             physical_ms: ms,
             counter,
-            device: DeviceId([dev; 16]),
+            replica: ReplicaId([dev; 16]),
         }
     }
 
     #[test]
-    fn hlc_orders_by_time_then_counter_then_device() {
+    fn hlc_orders_by_time_then_counter_then_replica() {
         assert!(hlc(2, 0, 0) > hlc(1, 9, 9));
         assert!(hlc(1, 2, 0) > hlc(1, 1, 9));
         assert!(hlc(1, 1, 2) > hlc(1, 1, 1));
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn clock_is_strictly_increasing_and_follows_observed() {
-        let clock = HlcClock::new(DeviceId([1; 16]));
+        let clock = HlcClock::new(ReplicaId([1; 16]));
         let a = clock.now();
         let b = clock.now();
         assert!(b > a);
@@ -371,7 +371,7 @@ mod tests {
             lsn: 42,
             commit_hlc: hlc(1000, 3, 7),
             origin: Some(Origin {
-                device: DeviceId([9; 16]),
+                replica: ReplicaId([9; 16]),
                 first_seq: 5,
                 last_seq: 6,
             }),

@@ -27,7 +27,7 @@ Zero-padded decimal numbers make keys sort in numeric order.
 |---|---|
 | `physical_ms` | `u64`, milliseconds since the Unix epoch |
 | `counter` | `u32` |
-| `device` | 16 bytes |
+| `replica` | 16 bytes |
 
 Compared field by field in that order.
 
@@ -48,11 +48,11 @@ One atomic batch. Applied completely or not at all.
 |---|---|
 | `lsn` | `u64` |
 | `commit_hlc` | timestamp |
-| `origin` | `u8` 0, or `u8` 1 followed by `device` (16 bytes), `first_seq` `u64`, `last_seq` `u64` |
+| `origin` | `u8` 0, or `u8` 1 followed by `replica` (16 bytes), `first_seq` `u64`, `last_seq` `u64` |
 | `op_count` | `u32` |
 | operations | `op_count` operations |
 
-`origin` is present on frames built from a device's outbox. A frame may have zero
+`origin` is present on frames built from a replica's outbox. A frame may have zero
 operations and exist only to record `origin`.
 
 ## Segment
@@ -98,8 +98,8 @@ Records:
 
 - tag `0`, an entry: `tombstone` `u8`, timestamp, `key` byte string, `value` byte string.
   Entries appear in ascending key order across the parts.
-- tag `1`, a device watermark: `device` (16 bytes), `seq` `u64`: the highest outbox
-  sequence number applied for that device.
+- tag `1`, a replica watermark: `replica` (16 bytes), `seq` `u64`: the highest outbox
+  sequence number applied for that replica.
 
 ## `manifest.json`
 

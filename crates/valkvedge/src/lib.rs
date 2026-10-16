@@ -28,7 +28,7 @@
 //!   object store. Nothing acknowledged is lost if the process or machine dies.
 //! - [`Durability::Buffered`]: the write returns after it is in the local
 //!   outbox. It is readable at once and uploaded in batches. It works offline.
-//!   It can be lost if the device is lost before the upload, and it can lose a
+//!   It can be lost if the replica is lost before the upload, and it can lose a
 //!   conflict to a newer write to the same key (see [`Database::take_events`]).
 //!
 //! # Conditional writes
@@ -53,7 +53,7 @@
 //!
 //! [`Database::watch`] reports every change to keys under a prefix as it
 //! reaches the local copy, whoever made it: this process, a replica pull, or
-//! another device's write arriving from a hosted service.
+//! another replica's write arriving from a hosted service.
 
 #![forbid(unsafe_code)]
 
@@ -76,8 +76,8 @@ use valkvedge_log::{HlcClock, Layout, Node, Store};
 use valkvedge_sync::{Change, Condition, StateStore, Writer};
 
 pub use local::Iter;
-pub use valkvedge_log::{DeviceId, Hlc, Op};
 pub use valkvedge_log::{Error as ValkvEdgeError, LeaseConfig, Lsn, OpKind, RejectReason, Result};
+pub use valkvedge_log::{Hlc, Op, ReplicaId};
 pub use valkvedge_sync::{OpOutcome, OutboxEntry, PushReport, WriterConfig};
 pub use watch::{Watch, WatchEvent};
 
@@ -212,7 +212,7 @@ pub type TokenFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
 /// a time. See [`Builder::remote_with_tokens`].
 ///
 /// Usually this asks your own backend, which holds the API key and mints
-/// tokens for the user signed in on this device. It is called when a
+/// tokens for the user signed in on this replica. It is called when a
 /// database is first used, shortly before its token expires, and when the
 /// service refuses a token. Any closure `Fn(String) -> impl Future<Output =
 /// Result<String>>` is a token source; it receives the database name.
@@ -273,7 +273,7 @@ impl Builder {
 
     /// Connects to a hosted service instead of an object store of your own.
     ///
-    /// The device needs no storage credentials, only the service's URL and an
+    /// The replica needs no storage credentials, only the service's URL and an
     /// API key. Sync writes are confirmed by the service, buffered writes are
     /// pushed to it, and the local copy follows it. Reads stay local.
     /// Databases are addressed by the names they have in the service. See
@@ -286,9 +286,9 @@ impl Builder {
     /// Connects to a hosted service with short-lived tokens instead of an
     /// API key.
     ///
-    /// Use this on devices you do not control, such as an app on a user's
+    /// Use this on replicas you do not control, such as an app on a user's
     /// phone: the API key stays on your backend, which mints a token for one
-    /// database with read or write access, and the device never holds more
+    /// database with read or write access, and the replica never holds more
     /// than that. `tokens` is asked for a token per database and asked again
     /// before one expires or when the service refuses it. Everything else
     /// works as with [`Builder::remote`].
@@ -422,10 +422,9 @@ impl Inner {
         let node =
             self.node
                 .get_or_try_init(|| async {
-                    let id =
-                        self.options.node_id.clone().unwrap_or_else(|| {
-                            format!("direct-{}", valkvedge_log::DeviceId::random())
-                        });
+                    let id = self.options.node_id.clone().unwrap_or_else(|| {
+                        format!("direct-{}", valkvedge_log::ReplicaId::random())
+                    });
                     Node::start(
                         store.clone(),
                         id,
@@ -462,7 +461,7 @@ impl Inner {
             .has_outbox
             .store(store.outbox_stat()?.entries > 0, Ordering::Relaxed);
         let open = Arc::new(Open {
-            clock: Arc::new(HlcClock::new(store.device_id()?)),
+            clock: Arc::new(HlcClock::new(store.replica_id()?)),
             store,
             session: tokio::sync::Mutex::new(None),
         });
@@ -793,7 +792,7 @@ impl DatabaseBuilder {
                 {
                     open.store.set_encryption_check(&check)?;
                 }
-                // A device with no local copy of a hosted database downloads it.
+                // A replica with no local copy of a hosted database downloads it.
                 let cold = pos == Default::default() || open.store.needs_bootstrap()?;
                 if db.kv.is_remote() && cold {
                     drop(open);
@@ -1134,7 +1133,7 @@ impl Database {
                         url,
                         auth.clone(),
                         &self.shared.name,
-                        open.clock.device(),
+                        open.clock.replica(),
                         self.kv.options.sync_write_timeout,
                     )?;
                     return Ok(Session::Remote(Box::new(client)));
@@ -1343,7 +1342,7 @@ impl Database {
             }
             (Some(Role::Writer), Durability::Buffered) => {
                 // No network and no session: this path must work offline.
-                // A write made now is later than whatever this device already
+                // A write made now is later than whatever this replica already
                 // holds for the key, even if that was stamped by another
                 // process or by a clock slightly ahead of this one.
                 for change in &changes {
@@ -1437,7 +1436,7 @@ impl Database {
             let limit = self.kv.options.sync_write_timeout;
             let pushed = match session.as_ref() {
                 Session::Writer(writer) => {
-                    let pushing = writer.push(open.clock.device(), entries.clone());
+                    let pushing = writer.push(open.clock.replica(), entries.clone());
                     tokio::time::timeout(limit, pushing)
                         .await
                         .unwrap_or_else(|_| {
@@ -1447,7 +1446,7 @@ impl Database {
                         })
                 }
                 Session::Remote(client) => {
-                    match client.push(open.clock.device(), &entries).await {
+                    match client.push(open.clock.replica(), &entries).await {
                         // The winners must be in the local copy before the
                         // pending entries that hid them are removed.
                         Ok(report) => client.pull(open.store.as_ref()).await.map(|_| report),
@@ -1590,18 +1589,18 @@ impl Database {
             .map(|(_, layout)| layout.prefix().to_string())
     }
 
-    /// Applies outbox entries that another device made, as the writer.
+    /// Applies outbox entries that another replica made, as the writer.
     ///
     /// This is the receiving end of a push: each entry becomes one frame
     /// holding the operations that won, by last write wins per key. Entries at
-    /// or below the device's watermark are reported as duplicates and not
+    /// or below the replica's watermark are reported as duplicates and not
     /// applied again, so the sender can retry safely.
     ///
-    /// Use it when this process is the writer and other devices hand it their
+    /// Use it when this process is the writer and other replicas hand it their
     /// buffered writes over a channel of your own.
     pub async fn accept_push(
         &self,
-        device: DeviceId,
+        replica: ReplicaId,
         entries: Vec<OutboxEntry>,
     ) -> Result<PushReport> {
         let open = self.open()?;
@@ -1612,7 +1611,7 @@ impl Database {
             ));
         };
         let limit = self.kv.options.sync_write_timeout;
-        let pushed = tokio::time::timeout(limit, writer.push(device, entries))
+        let pushed = tokio::time::timeout(limit, writer.push(replica, entries))
             .await
             .unwrap_or_else(|_| {
                 Err(ValkvEdgeError::Unavailable(format!(
