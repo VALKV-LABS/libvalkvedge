@@ -1092,7 +1092,15 @@ impl Database {
         if self.shared.has_outbox.load(Ordering::Relaxed) {
             self.flush().await?;
         }
-        for _ in 0..UPDATE_ATTEMPTS {
+        for attempt in 0..UPDATE_ATTEMPTS {
+            if attempt > 0 {
+                // Another writer won. Wait a moment, longer each time, so
+                // writers racing for one key take turns instead of colliding
+                // again and again.
+                let ceiling = 1u64 << attempt.min(6);
+                let pause = rand::Rng::gen_range(&mut rand::thread_rng(), 0..=ceiling);
+                tokio::time::sleep(Duration::from_millis(pause)).await;
+            }
             let current = if self.shared.ingest() {
                 self.fetch_versioned(key).await?
             } else {
