@@ -191,6 +191,7 @@ The library turns these into `ValkvEdgeError`, and `code()` returns the same str
 | `STORAGE_QUOTA_EXCEEDED` | The account is over its storage limit; reads and deletes still work |
 | `DATABASE_SIZE_EXCEEDED` | This database is over the size the service allows one database; reads and deletes still work |
 | `TRANSFER_QUOTA_EXCEEDED` | The account has moved as much data as the service allows for now; reads or writes, as the message says, fail until it lifts |
+| `WRITE_QUOTA_EXCEEDED` | The account has made as many writes as the service allows for now; reads and deletes still work |
 | `RATE_LIMITED` | Slow down and retry |
 | `KEY_TOO_LARGE`, `VALUE_TOO_LARGE`, `BATCH_TOO_LARGE` | The same limits the library enforces locally |
 | `LEASE_HELD` | The database is changing hands; retry shortly |

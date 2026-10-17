@@ -76,6 +76,7 @@ fn known_code(code: &str) -> &'static str {
         "STORAGE_QUOTA_EXCEEDED",
         "DATABASE_SIZE_EXCEEDED",
         "TRANSFER_QUOTA_EXCEEDED",
+        "WRITE_QUOTA_EXCEEDED",
         "RATE_LIMITED",
         "DATABASE_NOT_READY",
         "LEASE_HELD",
