@@ -443,7 +443,7 @@ impl LogWriter {
 mod tests {
     use super::*;
     use crate::lease::LeaseConfig;
-    use crate::types::{DeviceId, Hlc, Op, OpKind};
+    use crate::types::{Hlc, Op, OpKind, ReplicaId};
     use std::time::Duration;
 
     fn fast() -> LeaseConfig {
@@ -466,7 +466,7 @@ mod tests {
                 hlc: Hlc {
                     physical_ms: lsn,
                     counter: 0,
-                    device: DeviceId([1; 16]),
+                    replica: ReplicaId([1; 16]),
                 },
             }],
         }

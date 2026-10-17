@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use valkvedge_log::{
-    now_ms, DeviceId, Hlc, HlcClock, Layout, LeaseConfig, Node, Op, OpKind, RejectReason, Store,
+    now_ms, Hlc, HlcClock, Layout, LeaseConfig, Node, Op, OpKind, RejectReason, ReplicaId, Store,
 };
 use valkvedge_sync::{
     pull, remote_head, Change, MemState, OpOutcome, OutboxEntry, StateStore, Writer, WriterConfig,
@@ -41,7 +41,7 @@ async fn writer_with(
         Layout::new("db"),
         node,
         state,
-        Arc::new(HlcClock::new(DeviceId::random())),
+        Arc::new(HlcClock::new(ReplicaId::random())),
         config,
         wait,
     )
@@ -65,7 +65,7 @@ fn del(key: &str) -> Change {
     }
 }
 
-fn stamped(key: &str, value: &str, ms: u64, device: DeviceId) -> Op {
+fn stamped(key: &str, value: &str, ms: u64, replica: ReplicaId) -> Op {
     Op {
         kind: OpKind::Put,
         key: key.as_bytes().to_vec(),
@@ -73,7 +73,7 @@ fn stamped(key: &str, value: &str, ms: u64, device: DeviceId) -> Op {
         hlc: Hlc {
             physical_ms: ms,
             counter: 0,
-            device,
+            replica,
         },
     }
 }
@@ -217,7 +217,7 @@ async fn pushed_writes_resolve_by_last_write_wins_per_key() {
     let store = Store::memory();
     let state = Arc::new(MemState::new());
     let w = writer_on(&store, "a", state.clone(), false).await;
-    let (phone, laptop) = (DeviceId([1; 16]), DeviceId([2; 16]));
+    let (phone, laptop) = (ReplicaId([1; 16]), ReplicaId([2; 16]));
     let t = now_ms();
 
     // The laptop wrote later but pushes first.
@@ -260,16 +260,16 @@ async fn a_delete_beats_an_older_buffered_write() {
     let store = Store::memory();
     let state = Arc::new(MemState::new());
     let w = writer_on(&store, "a", state.clone(), false).await;
-    let device = DeviceId([1; 16]);
+    let replica = ReplicaId([1; 16]);
     w.commit(vec![put("k", "v")]).await.unwrap();
     w.commit(vec![del("k")]).await.unwrap();
 
     let report = w
         .push(
-            device,
+            replica,
             vec![OutboxEntry {
                 seq: 1,
-                ops: vec![stamped("k", "zombie", now_ms() - 60_000, device)],
+                ops: vec![stamped("k", "zombie", now_ms() - 60_000, replica)],
             }],
         )
         .await
@@ -283,13 +283,13 @@ async fn a_sync_write_beats_an_earlier_write_stamped_in_the_future() {
     let store = Store::memory();
     let state = Arc::new(MemState::new());
     let w = writer_on(&store, "a", state.clone(), false).await;
-    let device = DeviceId([1; 16]);
+    let replica = ReplicaId([1; 16]);
     let ahead = now_ms() + 60_000; // inside the allowed skew
     w.push(
-        device,
+        replica,
         vec![OutboxEntry {
             seq: 1,
-            ops: vec![stamped("k", "from-the-future", ahead, device)],
+            ops: vec![stamped("k", "from-the-future", ahead, replica)],
         }],
     )
     .await
@@ -309,17 +309,17 @@ async fn clock_skew_and_stale_writes_are_rejected_and_reported() {
         ..WriterConfig::default()
     };
     let w = writer_with(&store, "a", state.clone(), false, config).await;
-    let device = DeviceId([1; 16]);
+    let replica = ReplicaId([1; 16]);
     let t = now_ms();
     let report = w
         .push(
-            device,
+            replica,
             vec![OutboxEntry {
                 seq: 1,
                 ops: vec![
-                    stamped("future", "x", t + 10 * 60_000, device),
-                    stamped("ancient", "x", t - 2 * 3_600_000, device),
-                    stamped("fine", "x", t, device),
+                    stamped("future", "x", t + 10 * 60_000, replica),
+                    stamped("ancient", "x", t - 2 * 3_600_000, replica),
+                    stamped("fine", "x", t, replica),
                 ],
             }],
         )
@@ -345,23 +345,23 @@ async fn clock_skew_and_stale_writes_are_rejected_and_reported() {
 async fn a_retried_push_is_not_applied_twice_even_after_failover() {
     let store = Store::memory();
     let layout = Layout::new("db");
-    let device = DeviceId([1; 16]);
+    let replica = ReplicaId([1; 16]);
     let t = now_ms();
     let entries = || {
         vec![
             OutboxEntry {
                 seq: 1,
-                ops: vec![stamped("k", "first", t - 2_000, device)],
+                ops: vec![stamped("k", "first", t - 2_000, replica)],
             },
             OutboxEntry {
                 seq: 2,
-                ops: vec![stamped("k", "second", t - 1_000, device)],
+                ops: vec![stamped("k", "second", t - 1_000, replica)],
             },
         ]
     };
 
     let a = writer_on(&store, "a", Arc::new(MemState::new()), false).await;
-    let first = a.push(device, entries()).await.unwrap();
+    let first = a.push(replica, entries()).await.unwrap();
     assert_eq!((first.watermark, first.lsn), (2, 2));
     a.release().await.unwrap();
 
@@ -369,8 +369,8 @@ async fn a_retried_push_is_not_applied_twice_even_after_failover() {
     // from the log.
     let state_b = Arc::new(MemState::new());
     let b = writer_on(&store, "b", state_b.clone(), false).await;
-    assert_eq!(state_b.watermark(&device).unwrap(), 2);
-    let retry = b.push(device, entries()).await.unwrap();
+    assert_eq!(state_b.watermark(&replica).unwrap(), 2);
+    let retry = b.push(replica, entries()).await.unwrap();
     assert_eq!(
         retry.entries,
         vec![
@@ -387,22 +387,22 @@ async fn a_retried_push_is_not_applied_twice_even_after_failover() {
 async fn watermarks_survive_compaction() {
     let store = Store::memory();
     let layout = Layout::new("db");
-    let device = DeviceId([1; 16]);
+    let pusher = ReplicaId([1; 16]);
     let w = writer_on(&store, "a", Arc::new(MemState::new()), false).await;
     w.push(
-        device,
+        pusher,
         vec![OutboxEntry {
             seq: 7,
-            ops: vec![stamped("k", "v", now_ms(), device)],
+            ops: vec![stamped("k", "v", now_ms(), pusher)],
         }],
     )
     .await
     .unwrap();
     w.compact().await.unwrap();
 
-    let replica = MemState::new();
-    assert!(pull(&store, &layout, &replica).await.unwrap().bootstrapped);
-    assert_eq!(replica.watermark(&device).unwrap(), 7);
+    let follower = MemState::new();
+    assert!(pull(&store, &layout, &follower).await.unwrap().bootstrapped);
+    assert_eq!(follower.watermark(&pusher).unwrap(), 7);
 }
 
 #[tokio::test]
@@ -417,7 +417,7 @@ async fn no_acknowledged_write_is_lost_when_the_owner_dies() {
         layout.clone(),
         node_a.clone(),
         Arc::new(MemState::new()),
-        Arc::new(HlcClock::new(DeviceId::random())),
+        Arc::new(HlcClock::new(ReplicaId::random())),
         WriterConfig::default(),
         false,
     )

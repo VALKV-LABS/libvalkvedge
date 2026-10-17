@@ -1,4 +1,4 @@
-//! The client side of the data API: how a device reaches a database that a
+//! The client side of the data API: how a replica reaches a database that a
 //! service, not this process, writes to the object store.
 //!
 //! The API is described in `docs/hosted-api.md`.
@@ -11,15 +11,17 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use valkvedge_log::format::decode_snapshot_part;
 use valkvedge_log::{
-    now_ms, ChainPos, DeviceId, Error, Frame, Hlc, Lsn, OpKind, RejectReason, Result, Segment,
+    now_ms, ChainPos, Error, Frame, Hlc, Lsn, OpKind, RejectReason, ReplicaId, Result, Segment,
 };
 use valkvedge_sync::{Change, Condition, OpOutcome, OutboxEntry, PushReport, StateStore};
 
 /// Header carrying the error code of a failed request.
 const ERROR_CODE_HEADER: &str = "x-edgekv-error";
-/// Header by which this device names itself when it reads, so the service can
-/// tell which devices follow a database and how far each has got.
-const DEVICE_HEADER: &str = "x-edgekv-device";
+/// Header by which this replica names itself when it reads, so the service can
+/// tell which replicas follow a database and how far each has got.
+const REPLICA_HEADER: &str = "x-edgekv-replica";
+/// Header carrying the version of a value read.
+const VERSION_HEADER: &str = "x-edgekv-version";
 /// How long a download (log page or snapshot part) may take.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// A token is replaced this long before it expires, so a request never
@@ -36,7 +38,7 @@ pub(crate) struct Client {
     /// if it does not say).
     token: tokio::sync::Mutex<Option<(String, u64)>>,
     /// This installation's id for the database: the same one its pushes carry.
-    device: DeviceId,
+    replica: ReplicaId,
     /// Bound on a commit or a push.
     write_timeout: Duration,
 }
@@ -72,10 +74,14 @@ fn known_code(code: &str) -> &'static str {
         "FORBIDDEN",
         "ACCOUNT_SUSPENDED",
         "STORAGE_QUOTA_EXCEEDED",
+        "DATABASE_SIZE_EXCEEDED",
+        "TRANSFER_QUOTA_EXCEEDED",
+        "WRITE_QUOTA_EXCEEDED",
         "RATE_LIMITED",
         "DATABASE_NOT_READY",
         "LEASE_HELD",
         "BAD_REQUEST",
+        "KEY_NOT_FOUND",
         "SNAPSHOT_REQUIRED",
         "SNAPSHOT_CHANGED",
         "INVALID_PAGE_TOKEN",
@@ -105,7 +111,7 @@ fn service_error(status: reqwest::StatusCode, code: Option<String>, body: &[u8])
                 .and_then(|key| B64.decode(key).ok())
                 .unwrap_or_default(),
         },
-        "NOT_FOUND" | "KEY_NOT_FOUND" => Error::NotFound(message),
+        "NOT_FOUND" => Error::NotFound(message),
         "UNAVAILABLE" => Error::Unavailable(message),
         "KEY_TOO_LARGE" => Error::KeyTooLarge {
             limit: crate::MAX_KEY_BYTES,
@@ -137,7 +143,7 @@ impl Client {
         base_url: &str,
         auth: Auth,
         database: &str,
-        device: DeviceId,
+        replica: ReplicaId,
         write_timeout: Duration,
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
@@ -150,7 +156,7 @@ impl Client {
             auth,
             database: database.to_string(),
             token: tokio::sync::Mutex::new(None),
-            device,
+            replica,
             write_timeout,
         })
     }
@@ -291,7 +297,7 @@ impl Client {
     /// Hands outbox entries to the service. Safe to repeat.
     pub(crate) async fn push(
         &self,
-        device: DeviceId,
+        replica: ReplicaId,
         entries: &[OutboxEntry],
     ) -> Result<PushReport> {
         let body: Vec<Value> = entries
@@ -313,7 +319,7 @@ impl Client {
             })
             .collect();
         let request = self.http.post(format!("{}/push", self.base)).json(&json!({
-            "device_id": device.to_string(),
+            "replica_id": replica.to_string(),
             "entries": body,
         }));
         let reply = self.json(request, self.write_timeout).await?;
@@ -341,12 +347,93 @@ impl Client {
         })
     }
 
+    /// Reads one key from the service, with its version. The key must be
+    /// UTF-8 text, as it travels in the URL path.
+    pub(crate) async fn get(&self, key: &[u8]) -> Result<Option<(Vec<u8>, Hlc)>> {
+        let mut url = self.url("kv")?;
+        {
+            let text = std::str::from_utf8(key).map_err(|_| {
+                Error::Unsupported("a key read from the service must be UTF-8 text".into())
+            })?;
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| Error::local("the service URL cannot take a path"))?;
+            for segment in text.split('/') {
+                segments.push(segment);
+            }
+        }
+        let response = match self.send(self.http.get(url), self.write_timeout).await {
+            Ok(response) => response,
+            Err(Error::Service {
+                code: "KEY_NOT_FOUND",
+                ..
+            }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let version: Version = response
+            .headers()
+            .get(VERSION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| Error::corrupt("a value from the service came without its version"))?;
+        let value = response
+            .bytes()
+            .await
+            .map_err(|e| unavailable("the response was cut short", e))?;
+        Ok(Some((value.to_vec(), version.hlc())))
+    }
+
+    /// One page of keys starting with `prefix`, in order, from the service,
+    /// with each value and its version, and the token for the next page.
+    /// The prefix must be UTF-8 text, as it travels in the query.
+    pub(crate) async fn scan(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        page_token: Option<&str>,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>, Hlc)>, Option<String>)> {
+        let prefix = std::str::from_utf8(prefix).map_err(|_| {
+            Error::Unsupported("a prefix read from the service must be UTF-8 text".into())
+        })?;
+        let mut url = self.url("kv")?;
+        url.query_pairs_mut()
+            .append_pair("prefix", prefix)
+            .append_pair("limit", &limit.to_string());
+        if let Some(token) = page_token {
+            url.query_pairs_mut().append_pair("page_token", token);
+        }
+        let reply = self.json(self.http.get(url), self.write_timeout).await?;
+        let malformed = || Error::corrupt("scan response is malformed");
+        let mut entries = Vec::new();
+        for item in reply["items"].as_array().ok_or_else(malformed)? {
+            let field = |name: &str| {
+                item[name]
+                    .as_str()
+                    .and_then(|text| B64.decode(text).ok())
+                    .ok_or_else(malformed)
+            };
+            let version: Version = item["version"]
+                .as_str()
+                .and_then(|text| text.parse().ok())
+                .ok_or_else(malformed)?;
+            entries.push((field("key")?, field("value")?, version.hlc()));
+        }
+        let next = reply["next_page_token"].as_str().map(str::to_string);
+        Ok((entries, next))
+    }
+
+    /// The database's URL with `path` appended.
+    fn url(&self, path: &str) -> Result<reqwest::Url> {
+        reqwest::Url::parse(&format!("{}/{path}", self.base))
+            .map_err(|e| Error::local(format!("the service URL is not valid: {e}")))
+    }
+
     /// The newest LSN the service holds for this database.
     pub(crate) async fn head(&self) -> Result<Lsn> {
         let request = self
             .http
             .get(format!("{}/head", self.base))
-            .header(DEVICE_HEADER, self.device.to_string());
+            .header(REPLICA_HEADER, self.replica.to_string());
         let reply = self.json(request, self.write_timeout).await?;
         reply["lsn"]
             .as_u64()
@@ -354,12 +441,12 @@ impl Client {
     }
 
     async fn log(&self, after: Lsn) -> Result<LogPage> {
-        // `after` is how far this device has read: with the device header,
+        // `after` is how far this replica has read: with the replica header,
         // the service knows how far behind it is.
         let request = self
             .http
             .get(format!("{}/log?after={after}", self.base))
-            .header(DEVICE_HEADER, self.device.to_string());
+            .header(REPLICA_HEADER, self.replica.to_string());
         let response = match self.send(request, DOWNLOAD_TIMEOUT).await {
             Ok(response) => response,
             Err(Error::Service {

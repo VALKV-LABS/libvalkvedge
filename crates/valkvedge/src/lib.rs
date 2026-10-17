@@ -28,7 +28,7 @@
 //!   object store. Nothing acknowledged is lost if the process or machine dies.
 //! - [`Durability::Buffered`]: the write returns after it is in the local
 //!   outbox. It is readable at once and uploaded in batches. It works offline.
-//!   It can be lost if the device is lost before the upload, and it can lose a
+//!   It can be lost if the replica is lost before the upload, and it can lose a
 //!   conflict to a newer write to the same key (see [`Database::take_events`]).
 //!
 //! # Conditional writes
@@ -53,7 +53,7 @@
 //!
 //! [`Database::watch`] reports every change to keys under a prefix as it
 //! reaches the local copy, whoever made it: this process, a replica pull, or
-//! another device's write arriving from a hosted service.
+//! another replica's write arriving from a hosted service.
 
 #![forbid(unsafe_code)]
 
@@ -76,8 +76,8 @@ use valkvedge_log::{HlcClock, Layout, Node, Store};
 use valkvedge_sync::{Change, Condition, StateStore, Writer};
 
 pub use local::Iter;
-pub use valkvedge_log::{DeviceId, Hlc, Op};
 pub use valkvedge_log::{Error as ValkvEdgeError, LeaseConfig, Lsn, OpKind, RejectReason, Result};
+pub use valkvedge_log::{Hlc, Op, ReplicaId};
 pub use valkvedge_sync::{OpOutcome, OutboxEntry, PushReport, WriterConfig};
 pub use watch::{Watch, WatchEvent};
 
@@ -212,7 +212,7 @@ pub type TokenFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
 /// a time. See [`Builder::remote_with_tokens`].
 ///
 /// Usually this asks your own backend, which holds the API key and mints
-/// tokens for the user signed in on this device. It is called when a
+/// tokens for the user signed in on this replica. It is called when a
 /// database is first used, shortly before its token expires, and when the
 /// service refuses a token. Any closure `Fn(String) -> impl Future<Output =
 /// Result<String>>` is a token source; it receives the database name.
@@ -273,7 +273,7 @@ impl Builder {
 
     /// Connects to a hosted service instead of an object store of your own.
     ///
-    /// The device needs no storage credentials, only the service's URL and an
+    /// The replica needs no storage credentials, only the service's URL and an
     /// API key. Sync writes are confirmed by the service, buffered writes are
     /// pushed to it, and the local copy follows it. Reads stay local.
     /// Databases are addressed by the names they have in the service. See
@@ -286,9 +286,9 @@ impl Builder {
     /// Connects to a hosted service with short-lived tokens instead of an
     /// API key.
     ///
-    /// Use this on devices you do not control, such as an app on a user's
+    /// Use this on replicas you do not control, such as an app on a user's
     /// phone: the API key stays on your backend, which mints a token for one
-    /// database with read or write access, and the device never holds more
+    /// database with read or write access, and the replica never holds more
     /// than that. `tokens` is asked for a token per database and asked again
     /// before one expires or when the service refuses it. Everything else
     /// works as with [`Builder::remote`].
@@ -371,6 +371,9 @@ struct Shared {
     last_used_ms: AtomicU64,
     has_outbox: AtomicBool,
     cipher: OnceLock<Option<Arc<Cipher>>>,
+    /// Set by the first open: true when the database was opened for
+    /// ingestion ([`DatabaseBuilder::ingest`]) and keeps no local copy.
+    ingest: OnceLock<bool>,
     flush_lock: tokio::sync::Mutex<()>,
     events: Mutex<VecDeque<WriteEvent>>,
     /// Changes to the local copy, for [`Database::watch`].
@@ -422,10 +425,9 @@ impl Inner {
         let node =
             self.node
                 .get_or_try_init(|| async {
-                    let id =
-                        self.options.node_id.clone().unwrap_or_else(|| {
-                            format!("direct-{}", valkvedge_log::DeviceId::random())
-                        });
+                    let id = self.options.node_id.clone().unwrap_or_else(|| {
+                        format!("direct-{}", valkvedge_log::ReplicaId::random())
+                    });
                     Node::start(
                         store.clone(),
                         id,
@@ -462,7 +464,7 @@ impl Inner {
             .has_outbox
             .store(store.outbox_stat()?.entries > 0, Ordering::Relaxed);
         let open = Arc::new(Open {
-            clock: Arc::new(HlcClock::new(store.device_id()?)),
+            clock: Arc::new(HlcClock::new(store.replica_id()?)),
             store,
             session: tokio::sync::Mutex::new(None),
         });
@@ -577,6 +579,10 @@ impl Inner {
 }
 
 impl Shared {
+    fn ingest(&self) -> bool {
+        self.ingest.get().copied().unwrap_or(false)
+    }
+
     fn is_open(&self) -> bool {
         self.slot.lock().expect("slot lock").is_some()
     }
@@ -616,6 +622,7 @@ impl ValkvEdge {
             name: name.replace('/', "\0"),
             durability: Durability::default(),
             key: None,
+            ingest: false,
         }
     }
 
@@ -703,6 +710,7 @@ impl Namespace {
             name: format!("{}/{}", self.namespace, name.replace('/', "\0")),
             durability: Durability::default(),
             key: None,
+            ingest: false,
         }
     }
 }
@@ -713,9 +721,27 @@ pub struct DatabaseBuilder {
     name: String,
     durability: Durability,
     key: Option<[u8; 32]>,
+    ingest: bool,
 }
 
 impl DatabaseBuilder {
+    /// Opens the database for ingestion: writes are buffered on local disk,
+    /// uploaded in the background, and removed once the service has them;
+    /// nothing is downloaded and no local copy is kept. Reads go to the
+    /// service with [`Database::fetch`] and the other `fetch` methods; the
+    /// local reads ([`Database::get`], [`Database::prefix`], watching) fail
+    /// with `UNSUPPORTED`.
+    ///
+    /// For devices that mostly write, such as sensors, where a copy of the
+    /// whole database would only use disk. Needs a hosted service
+    /// ([`Builder::remote`]). Writes default to [`Durability::Buffered`];
+    /// sync and conditional writes still work and go straight to the service.
+    pub fn ingest(mut self) -> Self {
+        self.ingest = true;
+        self.durability = Durability::Buffered;
+        self
+    }
+
     /// Sets the durability used by writes that do not name one.
     pub fn durability(mut self, durability: Durability) -> Self {
         self.durability = durability;
@@ -755,6 +781,7 @@ impl DatabaseBuilder {
                     last_used_ms: AtomicU64::new(0),
                     has_outbox: AtomicBool::new(false),
                     cipher: OnceLock::new(),
+                    ingest: OnceLock::new(),
                     flush_lock: tokio::sync::Mutex::new(()),
                     events: Mutex::new(VecDeque::new()),
                     feed: tokio::sync::broadcast::channel(WATCH_BUFFER).0,
@@ -772,6 +799,17 @@ impl DatabaseBuilder {
         if !same {
             return Err(ValkvEdgeError::InvalidEncryptionKey(
                 "this database is already open with a different key".into(),
+            ));
+        }
+        if self.ingest && !self.kv.is_remote() {
+            return Err(ValkvEdgeError::Unsupported(
+                "ingestion needs a hosted service to upload to: build with remote()".into(),
+            ));
+        }
+        if *shared.ingest.get_or_init(|| self.ingest) != self.ingest {
+            return Err(ValkvEdgeError::Unsupported(
+                "this database is already open in this process for ingestion, or not for ingestion; open it the same way"
+                    .into(),
             ));
         }
 
@@ -793,9 +831,10 @@ impl DatabaseBuilder {
                 {
                     open.store.set_encryption_check(&check)?;
                 }
-                // A device with no local copy of a hosted database downloads it.
+                // A replica with no local copy of a hosted database downloads
+                // it, unless it is only ingesting.
                 let cold = pos == Default::default() || open.store.needs_bootstrap()?;
-                if db.kv.is_remote() && cold {
+                if db.kv.is_remote() && cold && !db.shared.ingest() {
                     drop(open);
                     db.sync().await?;
                 }
@@ -936,6 +975,17 @@ const MAX_EVENTS: usize = 1024;
 const WATCH_BUFFER: usize = 1024;
 /// How many times [`Database::update`] tries before giving up.
 const UPDATE_ATTEMPTS: usize = 16;
+/// The most entries [`Database::fetch_page`] asks the service for at once.
+const FETCH_PAGE_MAX: usize = 200;
+
+/// One page read from a hosted service by [`Database::fetch_page`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchPage {
+    /// Keys and their values, in key order.
+    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Pass to the next call to continue; `None` when there is no more.
+    pub next_page_token: Option<String>,
+}
 
 /// A handle to one database. Cheap to clone.
 ///
@@ -963,8 +1013,21 @@ impl Database {
         &self.shared.name
     }
 
+    /// Refuses a local read of a database opened for ingestion, which keeps
+    /// no local copy.
+    fn local_reads(&self) -> Result<()> {
+        if self.shared.ingest() {
+            return Err(ValkvEdgeError::Unsupported(
+                "this database is open for ingestion and keeps no local copy: read it from the service with fetch"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Reads a key from the local store. Never touches the network.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.local_reads()?;
         let open = self.open()?;
         match (open.store.get_stored(key)?, self.cipher()) {
             (None, _) => Ok(None),
@@ -981,6 +1044,7 @@ impl Database {
     /// local copy may be a moment behind; a write conditioned on an old
     /// version then fails and the copy is brought up to date.
     pub fn get_versioned(&self, key: &[u8]) -> Result<Option<(Vec<u8>, Version)>> {
+        self.local_reads()?;
         let open = self.open()?;
         match open.store.get_stored_versioned(key)? {
             None => Ok(None),
@@ -1002,6 +1066,7 @@ impl Database {
     /// A watched database stays open, and keeps following its hosted service
     /// or object store in the background, until the [`Watch`] is dropped.
     pub fn watch(&self, prefix: &[u8]) -> Result<Watch> {
+        self.local_reads()?;
         let open = self.open()?;
         Ok(Watch::new(
             self.clone(),
@@ -1027,8 +1092,20 @@ impl Database {
         if self.shared.has_outbox.load(Ordering::Relaxed) {
             self.flush().await?;
         }
-        for _ in 0..UPDATE_ATTEMPTS {
-            let current = self.get_versioned(key)?;
+        for attempt in 0..UPDATE_ATTEMPTS {
+            if attempt > 0 {
+                // Another writer won. Wait a moment, longer each time, so
+                // writers racing for one key take turns instead of colliding
+                // again and again.
+                let ceiling = 1u64 << attempt.min(6);
+                let pause = rand::Rng::gen_range(&mut rand::thread_rng(), 0..=ceiling);
+                tokio::time::sleep(Duration::from_millis(pause)).await;
+            }
+            let current = if self.shared.ingest() {
+                self.fetch_versioned(key).await?
+            } else {
+                self.get_versioned(key)?
+            };
             let next = change(current.as_ref().map(|(value, _)| value.as_slice()));
             let mut batch = self.batch();
             match &current {
@@ -1061,6 +1138,7 @@ impl Database {
             Bound::Excluded(k) => Bound::Excluded(k.as_ref().to_vec()),
             Bound::Unbounded => Bound::Unbounded,
         };
+        self.local_reads()?;
         let open = self.open()?;
         let iters = open
             .store
@@ -1070,9 +1148,82 @@ impl Database {
 
     /// Iterates keys starting with `prefix`, in order, from the local store.
     pub fn prefix(&self, prefix: &[u8]) -> Result<Iter> {
+        self.local_reads()?;
         let open = self.open()?;
         let iters = open.store.scan_prefix(prefix);
         Ok(Iter::new(iters, self.cipher().cloned(), open))
+    }
+
+    /// The session with the hosted service, for reading from it.
+    async fn service(&self) -> Result<Arc<Session>> {
+        if !self.kv.is_remote() {
+            return Err(ValkvEdgeError::Unsupported(
+                "fetch reads from a hosted service, and this database has none: read it with get"
+                    .into(),
+            ));
+        }
+        let open = self.open()?;
+        self.session_within_limit(&open).await
+    }
+
+    /// Reads a key from the hosted service rather than the local copy: the
+    /// newest stored value, at the cost of a request. The key must be UTF-8
+    /// text. This is how a database opened for ingestion is read; it works
+    /// for any database that follows a hosted service.
+    pub async fn fetch(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.fetch_versioned(key).await?.map(|(value, _)| value))
+    }
+
+    /// [`Database::fetch`] with the version of the value.
+    pub async fn fetch_versioned(&self, key: &[u8]) -> Result<Option<(Vec<u8>, Version)>> {
+        let session = self.service().await?;
+        let Session::Remote(client) = session.as_ref() else {
+            return Err(ValkvEdgeError::Unsupported(
+                "this database has no hosted service".into(),
+            ));
+        };
+        match client.get(key).await? {
+            None => Ok(None),
+            Some((stored, hlc)) => {
+                let value = match self.cipher() {
+                    None => stored,
+                    Some(cipher) => cipher.open(key, &stored)?,
+                };
+                Ok(Some((value, Version(hlc))))
+            }
+        }
+    }
+
+    /// One page of keys starting with `prefix`, in order, read from the
+    /// hosted service. `limit` is 1 to 200. Pass the page's
+    /// `next_page_token` back to continue. The prefix must be UTF-8 text.
+    pub async fn fetch_page(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        page_token: Option<&str>,
+    ) -> Result<FetchPage> {
+        let session = self.service().await?;
+        let Session::Remote(client) = session.as_ref() else {
+            return Err(ValkvEdgeError::Unsupported(
+                "this database has no hosted service".into(),
+            ));
+        };
+        let (items, next_page_token) = client
+            .scan(prefix, limit.clamp(1, FETCH_PAGE_MAX), page_token)
+            .await?;
+        let mut entries = Vec::with_capacity(items.len());
+        for (key, stored, _) in items {
+            let value = match self.cipher() {
+                None => stored,
+                Some(cipher) => cipher.open(&key, &stored)?,
+            };
+            entries.push((key, value));
+        }
+        Ok(FetchPage {
+            entries,
+            next_page_token,
+        })
     }
 
     /// Stores a value, with this handle's default durability.
@@ -1134,7 +1285,7 @@ impl Database {
                         url,
                         auth.clone(),
                         &self.shared.name,
-                        open.clock.device(),
+                        open.clock.replica(),
                         self.kv.options.sync_write_timeout,
                     )?;
                     return Ok(Session::Remote(Box::new(client)));
@@ -1227,20 +1378,24 @@ impl Database {
         if let Session::Remote(client) = session.as_ref() {
             // The service stores the write; the local copy then catches up to
             // it, so a read right after this returns sees it.
+            let ingest = self.shared.ingest();
             let (lsn, stamps) = match client.commit(&changes, conditions).await {
                 Ok(done) => done,
                 Err(e @ ValkvEdgeError::ConditionFailed { .. }) => {
                     // The local copy was behind what the condition was
                     // checked against. Catch up, so the caller's next read
                     // sees the value that won.
-                    if let Err(pull) = client.pull(open.store.as_ref()).await {
-                        tracing::warn!(database = %self.shared.name, error = %pull, "could not catch up after a failed condition");
+                    if !ingest {
+                        if let Err(pull) = client.pull(open.store.as_ref()).await {
+                            tracing::warn!(database = %self.shared.name, error = %pull, "could not catch up after a failed condition");
+                        }
                     }
                     return Err(e);
                 }
                 Err(e) => return Err(e),
             };
-            while open.store.position()?.applied_lsn < lsn {
+            // Ingesting, there is no local copy to bring up to the write.
+            while !ingest && open.store.position()?.applied_lsn < lsn {
                 let reached = client.pull(open.store.as_ref()).await?;
                 if reached < lsn {
                     return Err(unavailable(
@@ -1343,7 +1498,7 @@ impl Database {
             }
             (Some(Role::Writer), Durability::Buffered) => {
                 // No network and no session: this path must work offline.
-                // A write made now is later than whatever this device already
+                // A write made now is later than whatever this replica already
                 // holds for the key, even if that was stamped by another
                 // process or by a clock slightly ahead of this one.
                 for change in &changes {
@@ -1437,7 +1592,7 @@ impl Database {
             let limit = self.kv.options.sync_write_timeout;
             let pushed = match session.as_ref() {
                 Session::Writer(writer) => {
-                    let pushing = writer.push(open.clock.device(), entries.clone());
+                    let pushing = writer.push(open.clock.replica(), entries.clone());
                     tokio::time::timeout(limit, pushing)
                         .await
                         .unwrap_or_else(|_| {
@@ -1447,7 +1602,10 @@ impl Database {
                         })
                 }
                 Session::Remote(client) => {
-                    match client.push(open.clock.device(), &entries).await {
+                    match client.push(open.clock.replica(), &entries).await {
+                        // Ingesting, there is no local copy: once the service
+                        // has the entries, they are simply removed.
+                        Ok(report) if self.shared.ingest() => Ok(report),
                         // The winners must be in the local copy before the
                         // pending entries that hid them are removed.
                         Ok(report) => client.pull(open.store.as_ref()).await.map(|_| report),
@@ -1498,7 +1656,8 @@ impl Database {
     /// Brings the local copy up to date and returns its LSN.
     ///
     /// A writer pushes its outbox. A replica pulls new frames, or the current
-    /// snapshot if it is too far behind.
+    /// snapshot if it is too far behind. A database opened for ingestion only
+    /// uploads its buffered writes, and returns 0: it keeps no copy.
     pub async fn sync(&self) -> Result<Lsn> {
         let open = self.open()?;
         let session = self.session_within_limit(&open).await?;
@@ -1509,7 +1668,9 @@ impl Database {
             }
             Session::Remote(client) => {
                 self.flush().await?;
-                client.pull(open.store.as_ref()).await?;
+                if !self.shared.ingest() {
+                    client.pull(open.store.as_ref()).await?;
+                }
             }
             Session::Replica => {
                 let (store, layout) = self
@@ -1590,18 +1751,18 @@ impl Database {
             .map(|(_, layout)| layout.prefix().to_string())
     }
 
-    /// Applies outbox entries that another device made, as the writer.
+    /// Applies outbox entries that another replica made, as the writer.
     ///
     /// This is the receiving end of a push: each entry becomes one frame
     /// holding the operations that won, by last write wins per key. Entries at
-    /// or below the device's watermark are reported as duplicates and not
+    /// or below the replica's watermark are reported as duplicates and not
     /// applied again, so the sender can retry safely.
     ///
-    /// Use it when this process is the writer and other devices hand it their
+    /// Use it when this process is the writer and other replicas hand it their
     /// buffered writes over a channel of your own.
     pub async fn accept_push(
         &self,
-        device: DeviceId,
+        replica: ReplicaId,
         entries: Vec<OutboxEntry>,
     ) -> Result<PushReport> {
         let open = self.open()?;
@@ -1612,7 +1773,7 @@ impl Database {
             ));
         };
         let limit = self.kv.options.sync_write_timeout;
-        let pushed = tokio::time::timeout(limit, writer.push(device, entries))
+        let pushed = tokio::time::timeout(limit, writer.push(replica, entries))
             .await
             .unwrap_or_else(|_| {
                 Err(ValkvEdgeError::Unavailable(format!(

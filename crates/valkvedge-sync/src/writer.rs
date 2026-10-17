@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use valkvedge_log::{
-    now_ms, ChainPos, DeviceId, Error, Frame, Hlc, HlcClock, Layout, LogWriter, Lsn, Node, Op,
-    OpKind, Origin, Record, RejectReason, Result, Store,
+    now_ms, ChainPos, Error, Frame, Hlc, HlcClock, Layout, LogWriter, Lsn, Node, Op, OpKind,
+    Origin, Record, RejectReason, ReplicaId, Result, Store,
 };
 
 /// Tunables for a [`Writer`].
@@ -60,12 +60,12 @@ pub struct Condition {
     pub version: Option<Hlc>,
 }
 
-/// One entry from a device's outbox: an atomic batch with its sequence number.
+/// One entry from a replica's outbox: an atomic batch with its sequence number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxEntry {
-    /// The device's sequence number for this batch.
+    /// The replica's sequence number for this batch.
     pub seq: u64,
-    /// The operations, already stamped by the device.
+    /// The operations, already stamped by the replica.
     pub ops: Vec<Op>,
 }
 
@@ -85,7 +85,7 @@ pub enum OpOutcome {
 /// Result of [`Writer::push`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushReport {
-    /// The device's watermark after the push. Entries up to here are settled.
+    /// The replica's watermark after the push. Entries up to here are settled.
     pub watermark: u64,
     /// Log position after the push.
     pub lsn: Lsn,
@@ -244,20 +244,20 @@ impl<S: StateStore> Writer<S> {
         Ok((self.append(log, vec![frame]).await?, stamps))
     }
 
-    /// Applies entries from a device's outbox.
+    /// Applies entries from a replica's outbox.
     ///
     /// Each entry becomes one frame holding the operations that won. An entry
-    /// at or below the device's watermark is reported as a duplicate and not
+    /// at or below the replica's watermark is reported as a duplicate and not
     /// applied again, so a retried push is safe.
     pub async fn push(
         &self,
-        device: DeviceId,
+        replica: ReplicaId,
         mut entries: Vec<OutboxEntry>,
     ) -> Result<PushReport> {
         let mut guard = self.log.lock().await;
         let log = guard.as_mut().ok_or(Error::Fenced)?;
         entries.sort_by_key(|e| e.seq);
-        let mut watermark = self.state.watermark(&device)?;
+        let mut watermark = self.state.watermark(&replica)?;
         let now = now_ms();
         let too_new = now + self.config.max_clock_skew.as_millis() as u64;
         let too_old = now.saturating_sub(self.config.tombstone_retention.as_millis() as u64);
@@ -300,7 +300,7 @@ impl<S: StateStore> Writer<S> {
                 lsn,
                 commit_hlc: self.clock.now(),
                 origin: Some(Origin {
-                    device,
+                    replica,
                     first_seq: entry.seq,
                     last_seq: entry.seq,
                 }),

@@ -60,10 +60,10 @@ The form is `kv <local directory> <local|writer|replica> <database> <command>`.
 ### What you are simulating
 
 Everything runs on one machine, but each **local directory stands for a separate
-device**. `/tmp/a` and `/tmp/b` are two devices that have never heard of each other.
+replica**. `/tmp/a` and `/tmp/b` are two replicas that have never heard of each other.
 
 ```
-  "device a"                      S3 emulator                     "device b"
+  "replica a"                      S3 emulator                     "replica b"
   /tmp/a/notes/   ── writes ──▶   bucket valkvedge-test   ── reads ──▶   /tmp/b/notes/
   role: writer                    playground/notes/…              role: replica
 ```
@@ -76,7 +76,7 @@ device**. `/tmp/a` and `/tmp/b` are two devices that have never heard of each ot
 - The two never talk to each other. The bucket is the only thing they share. On real
   hardware the directories would be on different machines; nothing else would change.
 
-So "the replica is behind" means: device b's files have not yet been updated with
+So "the replica is behind" means: replica b's files have not yet been updated with
 something that is already in the bucket.
 
 ### 1. A sync write, and a replica that follows it
@@ -85,9 +85,9 @@ something that is already in the bucket.
 kv /tmp/a writer notes put greeting hello
 ```
 
-`stored at lsn 1`. Device a took ownership of `notes` (a lease object in the bucket),
+`stored at lsn 1`. Replica a took ownership of `notes` (a lease object in the bucket),
 uploaded the write as one log object, and only then applied it to `/tmp/a/notes`. The
-write is now in two places: the bucket and device a's disk.
+write is now in two places: the bucket and replica a's disk.
 
 ```sh
 kv /tmp/b replica notes scan
@@ -102,8 +102,8 @@ kv /tmp/a writer notes put later 1
 kv /tmp/b replica notes status
 ```
 
-`applied lsn 1`, `remote lsn 2`. Device b has not looked at the bucket since it opened,
-so its copy is one write behind. A `get later` on device b would say `(not found)`:
+`applied lsn 1`, `remote lsn 2`. Replica b has not looked at the bucket since it opened,
+so its copy is one write behind. A `get later` on replica b would say `(not found)`:
 reads are local and do not check the bucket.
 
 ```sh
@@ -169,22 +169,22 @@ stored before it.
 ```sh
 kv /tmp/a writer notes put-buffered title draft
 kv /tmp/a writer notes put title final
-kv /tmp/a writer notes get title      # draft: this device still sees its own pending write
+kv /tmp/a writer notes get title      # draft: this replica still sees its own pending write
 kv /tmp/a writer notes flush          # pushed 1 outbox entries
                                       #   title did not apply: Superseded
 kv /tmp/a writer notes get title      # final
 ```
 
-### 5. Compaction and a new device
+### 5. Compaction and a new replica
 
 ```sh
 kv /tmp/a writer notes compact        # now in generation 1
-kv /tmp/c replica notes status        # a brand-new device: generation 1, started from the snapshot
+kv /tmp/c replica notes status        # a brand-new replica: generation 1, started from the snapshot
 ```
 
 ### 6. A second writer
 
-Each command releases the database when it exits, so another device can take over at
+Each command releases the database when it exits, so another replica can take over at
 once:
 
 ```sh
