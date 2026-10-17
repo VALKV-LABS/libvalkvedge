@@ -152,6 +152,27 @@ mod tests {
         assert!(cipher.open(b"k", &flipped).is_err());
     }
 
+    /// The stored format is a contract: values sealed by other
+    /// implementations of it must open here. This one was sealed with a fixed
+    /// nonce by an independent implementation.
+    #[test]
+    fn a_value_sealed_elsewhere_in_this_format_opens() {
+        let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let sealed = unhex(
+            "a0a1a2a3a4a5a6a7a8a9aaab4dcf197f0189b4c8cc6e9071b3f75750df0d5894317f0dd9e2ece8f5",
+        )
+        .unwrap();
+        let cipher = Cipher::new(&key, "agent-memory");
+        assert_eq!(
+            cipher.open(b"facts/name", &sealed).unwrap(),
+            b"Ada Lovelace"
+        );
+        assert!(cipher.open(b"facts/other", &sealed).is_err());
+        assert!(Cipher::new(&key, "other-db")
+            .open(b"facts/name", &sealed)
+            .is_err());
+    }
+
     #[test]
     fn same_plaintext_seals_differently_each_time() {
         let cipher = Cipher::new(&[7; 32], "db");
