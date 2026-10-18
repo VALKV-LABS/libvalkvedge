@@ -127,6 +127,23 @@ been uploaded yet. `get`, `prefix`, `range` and `watch` fail with `UNSUPPORTED`;
 with `fetch`. Sync and conditional writes, and `update`, go straight to the service. A
 database is opened one way per process: for ingestion or not.
 
+## History and restores
+
+A service may keep each database's history for a while. `Database::history()` says how
+far back it reaches, and `Database::restore(point)` asks the service to put the database
+back as it was at that point, an LSN or a time:
+
+```rust
+use valkvedge::Point;
+let reach = db.history().await?;                       // from_lsn, from_ms, to_lsn
+db.restore(Point::Time(an_hour_ago_ms)).await?;        // every copy reloads
+```
+
+The local copy reloads before `restore` returns; other replicas reload when they next
+follow the database. A restore needs a credential that may write; a service may refuse
+it to access tokens. Branching a database, a copy that goes its own way, is the
+service's own business and not part of this API.
+
 ## What the client needs from the service
 
 The client speaks a small HTTP API. This section is for anyone who wants to check what
@@ -146,6 +163,8 @@ Every request is `Authorization: Bearer <api key or token>` under `/v1/db/{datab
 | `GET {part url}` | One snapshot part | Binary: one [snapshot part](format.md#snapshot-part) |
 | `GET /kv/{key}` | One value, for `fetch` | The value, with its version in `x-edgekv-version`; `404` `KEY_NOT_FOUND` if there is none |
 | `GET /kv?prefix=&limit=&page_token=` | A page of keys, for `fetch_page` | `{ "items": [{ "key", "value", "version" }], "next_page_token" }`, keys and values base64 |
+| `GET /history` | How far back it can be restored, for `Database::history` | `{ "from_lsn", "from", "to_lsn" }`; `from` is RFC 3339 or `null` |
+| `POST /restore` | Restore to `{ "lsn" }` or `{ "at": "<RFC 3339>" }`, for `Database::restore` | `{ "from_lsn", "lsn" }`; `409` `NOT_IN_HISTORY` outside the history |
 
 Keys and values travel base64-encoded in JSON bodies.
 

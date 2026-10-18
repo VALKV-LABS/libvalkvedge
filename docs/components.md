@@ -258,6 +258,32 @@ swapping the manifest to a new generation. Deletes older than the retention wind
 left out. The previous generation is kept for a grace period for replicas that are
 slightly behind, then deleted.
 
+## History
+
+With a history window (`WriterConfig::history`, or `DatabaseBuilder::history` for one
+database), the writer keeps what it needs to rebuild the database as it was at any
+point in that window: one **base** snapshot, at or before the window's start, and every
+log segment since, across generations. At each compaction the snapshots of replaced
+generations are deleted, except the base's and those of restores; their logs stay.
+Storage is about one snapshot plus what was written in the window.
+
+The state at a point (an LSN, or a time by each frame's commit time) is the newest kept
+snapshot at or before it, with the log applied up to the point
+(`valkvedge_sync::state_at`). Once the base is a quarter of the window older than it
+needs to be, the writer rebuilds the state at the generation the window now starts in,
+uploads it as that generation's snapshot, and deletes what came before; this runs in
+the background after a compaction, in a scratch store under the root (`.scratch`). So
+the history reaches back at least the window and at most a quarter further.
+
+`Database::restore(point)` rebuilds that state and installs it as a new generation whose
+snapshot is one LSN past the tail. No log leads there, so every replica reloads the
+snapshot, exactly as when it is too far behind. Writes after the point are undone;
+replicas' watermarks are kept at their highest, so pushes already applied are not
+applied twice. The restore is itself in the history. `Database::branch_from(source,
+point)` does the same into an empty database, without watermarks: a copy that then
+goes its own way. Encrypted databases cannot be branched, since values are sealed to
+the database's name.
+
 **Partial replicas.** A replica opened with `DatabaseBuilder::prefixes` keeps only the
 keys under those prefixes (at most 16). It reads the same segments and snapshot parts,
 and the local store drops every operation and snapshot entry outside the prefixes as it

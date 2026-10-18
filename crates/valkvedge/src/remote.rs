@@ -5,7 +5,7 @@
 
 use crate::local::LocalStore;
 use crate::prefixes::Prefixes;
-use crate::{Auth, Version};
+use crate::{Auth, History, Point, Restored, Version};
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
 use base64::Engine;
 use serde_json::{json, Value};
@@ -132,6 +132,7 @@ fn service_error(status: reqwest::StatusCode, code: Option<String>, body: &[u8])
             limit: crate::MAX_BATCH_BYTES,
         },
         "READ_ONLY" => Error::ReadOnly(message),
+        "NOT_IN_HISTORY" => Error::NotInHistory(message),
         _ if status.is_server_error() && code.is_empty() => Error::Unavailable(message),
         other => Error::Service {
             code: known_code(other),
@@ -454,6 +455,38 @@ impl Client {
             .map_err(|e| Error::local(format!("the service URL is not valid: {e}")))
     }
 
+    /// How far back the service can restore this database.
+    pub(crate) async fn history(&self) -> Result<History> {
+        let reply = self
+            .json(self.http.get(self.url("history")?), self.write_timeout)
+            .await?;
+        let malformed = || Error::corrupt("history response is malformed");
+        Ok(History {
+            from_lsn: reply["from_lsn"].as_u64().ok_or_else(malformed)?,
+            from_ms: match reply["from"].as_str() {
+                Some(text) => Some(parse_rfc3339(text).ok_or_else(malformed)?),
+                None => None,
+            },
+            to_lsn: reply["to_lsn"].as_u64().ok_or_else(malformed)?,
+        })
+    }
+
+    /// Asks the service to restore this database to `point`.
+    pub(crate) async fn restore(&self, point: Point) -> Result<Restored> {
+        let body = match point {
+            Point::Lsn(lsn) => json!({ "lsn": lsn }),
+            Point::Time(ms) => json!({ "at": rfc3339(ms) }),
+        };
+        let request = self.http.post(self.url("restore")?).json(&body);
+        // Rebuilding a large database takes a while.
+        let reply = self.json(request, DOWNLOAD_TIMEOUT).await?;
+        let malformed = || Error::corrupt("restore response is malformed");
+        Ok(Restored {
+            from: reply["from_lsn"].as_u64().ok_or_else(malformed)?,
+            lsn: reply["lsn"].as_u64().ok_or_else(malformed)?,
+        })
+    }
+
     /// The newest LSN the service holds for this database.
     pub(crate) async fn head(&self) -> Result<Lsn> {
         let request = self
@@ -594,6 +627,58 @@ impl Client {
     }
 }
 
+/// Milliseconds since the Unix epoch as RFC 3339 in UTC, to the millisecond.
+pub(crate) fn rfc3339(ms: u64) -> String {
+    let days = (ms / 86_400_000) as i64;
+    let in_day = ms % 86_400_000;
+    // Civil date from days since the epoch (H. Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        in_day / 3_600_000,
+        in_day / 60_000 % 60,
+        in_day / 1000 % 60,
+        in_day % 1000
+    )
+}
+
+/// The reverse of [`rfc3339`]: `YYYY-MM-DDTHH:MM:SS`, optional fraction,
+/// then `Z`.
+pub(crate) fn parse_rfc3339(text: &str) -> Option<u64> {
+    let text = text.strip_suffix('Z').or_else(|| text.strip_suffix('z'))?;
+    let (date, time) = text.split_once(['T', 't'])?;
+    let mut date = date.splitn(3, '-').map(|p| p.parse::<i64>().ok());
+    let (year, month, day) = (date.next()??, date.next()??, date.next()??);
+    let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
+    let mut clock = clock.splitn(3, ':').map(|p| p.parse::<u64>().ok());
+    let (hour, minute, second) = (clock.next()??, clock.next()??, clock.next()??);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let millis: u64 = format!("{fraction:0<3}")[..3].parse().ok()?;
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let m = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = u64::try_from(era * 146_097 + doe - 719_468).ok()?;
+    Some(days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * 1000 + millis)
+}
+
 /// The checksum a snapshot part ends with, which decoding then verifies
 /// against the part's contents.
 fn own_checksum(part: &[u8]) -> Result<u32> {
@@ -633,4 +718,31 @@ pub(crate) fn apply_frames(
             applied_lsn: last,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn times_travel_as_rfc3339_and_back() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(rfc3339(951_782_400_000), "2000-02-29T00:00:00.000Z");
+        for ms in [0, 951_782_400_000, 1_792_000_000_123, 4_102_444_799_999] {
+            assert_eq!(parse_rfc3339(&rfc3339(ms)), Some(ms), "{ms}");
+        }
+        assert_eq!(parse_rfc3339("2000-02-29T00:00:00Z"), Some(951_782_400_000));
+        assert_eq!(
+            parse_rfc3339("2000-02-29T00:00:00.5Z"),
+            Some(951_782_400_500)
+        );
+        for bad in [
+            "yesterday",
+            "2000-13-01T00:00:00Z",
+            "2000-02-29T00:00:00",
+            "",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad}");
+        }
+    }
 }

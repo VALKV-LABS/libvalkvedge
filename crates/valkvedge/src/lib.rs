@@ -81,7 +81,46 @@ pub use local::Iter;
 pub use prefixes::MAX_PREFIXES;
 pub use valkvedge_log::{Error as ValkvEdgeError, LeaseConfig, Lsn, OpKind, RejectReason, Result};
 pub use valkvedge_log::{Hlc, Op, ReplicaId};
-pub use valkvedge_sync::{OpOutcome, OutboxEntry, PushReport, WriterConfig};
+pub use valkvedge_sync::{History, OpOutcome, OutboxEntry, Point, PushReport, WriterConfig};
+
+/// Where scratch stores for rebuilding a past state are made, under the root.
+/// Database names cannot start with a dot.
+const SCRATCH_DIR: &str = ".scratch";
+
+/// What a restore or a branch did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Restored {
+    /// The point that was restored, as an LSN of the source's history.
+    pub from: Lsn,
+    /// The LSN the restored state has now: one past the tail when it was
+    /// installed, so replicas see it as new.
+    pub lsn: Lsn,
+}
+
+/// A local store for rebuilding a past state, removed when dropped.
+struct Scratch {
+    /// Always present until dropped.
+    store: Option<Arc<LocalStore>>,
+    path: PathBuf,
+}
+
+impl Scratch {
+    fn store(&self) -> &Arc<LocalStore> {
+        self.store.as_ref().expect("present until dropped")
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // Closed first, so its files are not written as they are removed.
+        drop(self.store.take());
+        // Best effort: another holder may still be closing it. A leftover
+        // is only disk.
+        if let Err(e) = std::fs::remove_dir_all(&self.path) {
+            tracing::debug!(path = %self.path.display(), error = %e, "scratch store not removed");
+        }
+    }
+}
 pub use watch::{Watch, WatchEvent};
 
 /// Re-export of the object store crate, for building a store to pass to
@@ -397,6 +436,11 @@ struct Shared {
     /// Set by the first open: for a partial copy, the prefixes it holds
     /// ([`DatabaseBuilder::prefixes`]).
     prefixes: OnceLock<Option<Prefixes>>,
+    /// How far back this database's history reaches, when set for it
+    /// ([`DatabaseBuilder::history`]); used by the next writer opened.
+    history: Mutex<Option<Duration>>,
+    /// The history's base is being moved forward.
+    maintaining: AtomicBool,
 }
 
 struct Open {
@@ -715,6 +759,7 @@ impl ValkvEdge {
             key: None,
             ingest: false,
             prefixes: None,
+            history: None,
         }
     }
 
@@ -811,6 +856,7 @@ impl Namespace {
             key: None,
             ingest: false,
             prefixes: None,
+            history: None,
         }
     }
 }
@@ -823,9 +869,19 @@ pub struct DatabaseBuilder {
     key: Option<[u8; 32]>,
     ingest: bool,
     prefixes: Option<Vec<Vec<u8>>>,
+    history: Option<Duration>,
 }
 
 impl DatabaseBuilder {
+    /// Keeps this database's history for `window`, so it can be restored
+    /// or branched from at any point that recent ([`Database::restore`]).
+    /// Overrides [`WriterConfig::history`] for this database; it takes
+    /// effect when this process next becomes its writer.
+    pub fn history(mut self, window: Duration) -> Self {
+        self.history = Some(window);
+        self
+    }
+
     /// Keeps a partial copy: only keys starting with one of `prefixes` are
     /// downloaded, stored and followed. Reads and writes of any other key,
     /// and scans and watches that reach past the prefixes, fail with
@@ -908,9 +964,14 @@ impl DatabaseBuilder {
                     feed: tokio::sync::broadcast::channel(WATCH_BUFFER).0,
                     following: AtomicBool::new(false),
                     prefixes: OnceLock::new(),
+                    history: Mutex::new(None),
+                    maintaining: AtomicBool::new(false),
                 })
             })
             .clone();
+        if let Some(history) = self.history {
+            *shared.history.lock().expect("history lock") = Some(history);
+        }
 
         let wanted = self.key.map(|k| Arc::new(Cipher::new(&k, &self.name)));
         let current = shared.cipher.get_or_init(|| wanted.clone());
@@ -1447,6 +1508,149 @@ impl Database {
         }
     }
 
+    /// The writer settings for this database: the process's, with its own
+    /// history window if it has one.
+    fn writer_config(&self) -> WriterConfig {
+        let mut config = self.kv.options.writer.clone();
+        if let Some(history) = *self.shared.history.lock().expect("history lock") {
+            config.history = history;
+        }
+        config
+    }
+
+    /// An empty local store under the root, for rebuilding a state from the
+    /// history. Removed when dropped.
+    fn scratch(&self) -> Result<Scratch> {
+        let path = self
+            .kv
+            .root
+            .join(SCRATCH_DIR)
+            .join(ReplicaId::random().to_string());
+        let store = LocalStore::open(
+            &path,
+            self.kv.options.cache_bytes_per_database,
+            false,
+            tokio::sync::broadcast::channel(1).0,
+            None,
+        )?;
+        Ok(Scratch {
+            store: Some(Arc::new(store)),
+            path,
+        })
+    }
+
+    /// How far back this database can be restored, or branched from.
+    /// Asks the hosted service, or reads the object store.
+    pub async fn history(&self) -> Result<History> {
+        if self.kv.is_remote() {
+            let open = self.open()?;
+            let session = self.session_within_limit(&open).await?;
+            if let Session::Remote(client) = session.as_ref() {
+                return client.history().await;
+            }
+        }
+        let (store, layout) = self.kv.layout(&self.shared.name).ok_or_else(|| {
+            ValkvEdgeError::Unsupported("this database has no object store, so no history".into())
+        })?;
+        valkvedge_sync::history(&store, &layout).await
+    }
+
+    /// Puts the database back as it was at `point`, within its history
+    /// ([`DatabaseBuilder::history`]): the writer rebuilds that state from
+    /// the history and installs it as a new generation. Every replica then
+    /// reloads the database. Writes made after the point are undone, and so
+    /// are writes made while the restore runs; buffered writes still waiting
+    /// on replicas apply on top when they are pushed. The restore is itself
+    /// part of the history, so it can be undone the same way.
+    ///
+    /// Only the writer, or a hosted service, can restore. Fails with
+    /// `NOT_IN_HISTORY` for a point the history does not reach.
+    pub async fn restore(&self, point: Point) -> Result<Restored> {
+        let open = self.open()?;
+        let session = self.session_within_limit(&open).await?;
+        match session.as_ref() {
+            Session::Remote(client) => {
+                let restored = client.restore(point).await?;
+                if !self.shared.ingest() {
+                    client.pull(open.store.as_ref()).await?;
+                }
+                Ok(restored)
+            }
+            Session::Writer(writer) => {
+                let (store, layout) = self
+                    .kv
+                    .layout(&self.shared.name)
+                    .expect("a writer has an object store");
+                let scratch = self.scratch()?;
+                let from =
+                    valkvedge_sync::state_at(&store, &layout, point, scratch.store().as_ref())
+                        .await?;
+                match writer.restore(scratch.store().clone(), true).await {
+                    Ok(pos) => Ok(Restored {
+                        from,
+                        lsn: pos.applied_lsn,
+                    }),
+                    Err(e) => {
+                        self.reset_session(&open, &session).await;
+                        Err(e)
+                    }
+                }
+            }
+            Session::Local | Session::Replica => Err(ValkvEdgeError::ReadOnly(
+                "only the writer of a database, or a hosted service, can restore it".into(),
+            )),
+        }
+    }
+
+    /// Fills this database, which must be empty, with what `source` held at
+    /// `point`: a branch. This process must be this database's writer, and
+    /// `source` must be in an object store it can read. The branch starts
+    /// with no replicas and a history of its own. Encrypted databases cannot
+    /// be branched: their values are sealed to the database's name.
+    pub async fn branch_from(&self, source: &Database, point: Point) -> Result<Restored> {
+        let unsupported = |why: &str| Err(ValkvEdgeError::Unsupported(why.into()));
+        if self.cipher().is_some() || source.cipher().is_some() {
+            return unsupported(
+                "an encrypted database cannot be branched: its values are sealed to its name",
+            );
+        }
+        let Some((store, layout)) = source.kv.layout(&source.shared.name) else {
+            return unsupported("a branch is made from a database in an object store");
+        };
+        let manifest = valkvedge_log::read_manifest(&store, &layout)
+            .await?
+            .ok_or_else(|| ValkvEdgeError::NotFound(source.shared.name.clone()))?
+            .0;
+        if manifest.encryption_check.is_some() {
+            return unsupported(
+                "an encrypted database cannot be branched: its values are sealed to its name",
+            );
+        }
+        let open = self.open()?;
+        let session = self.session_within_limit(&open).await?;
+        let Session::Writer(writer) = session.as_ref() else {
+            return Err(ValkvEdgeError::ReadOnly(
+                "only the writer of a database can fill it with a branch".into(),
+            ));
+        };
+        if writer.position().await?.applied_lsn != 0 {
+            return unsupported("a branch is made into an empty database");
+        }
+        let scratch = self.scratch()?;
+        let from =
+            valkvedge_sync::state_at(&store, &layout, point, scratch.store().as_ref()).await?;
+        match writer.restore(scratch.store().clone(), false).await {
+            Ok(pos) => Ok(Restored {
+                from,
+                lsn: pos.applied_lsn,
+            }),
+            Err(e) => {
+                self.reset_session(&open, &session).await;
+                Err(e)
+            }
+        }
+    }
+
     /// The database's session, created on first use and again after
     /// [`Database::reset_session`].
     async fn session(&self, open: &Arc<Open>) -> Result<Arc<Session>> {
@@ -1509,7 +1713,7 @@ impl Database {
                             node,
                             open.store.clone(),
                             open.clock.clone(),
-                            self.kv.options.writer.clone(),
+                            self.writer_config(),
                             wait_for_lease,
                         )
                         .await?
@@ -1767,6 +1971,24 @@ impl Database {
             if let Err(e) = writer.compact().await {
                 tracing::warn!(database = %self.shared.name, error = %e, "compaction failed");
                 self.reset_session(open, session).await;
+                return;
+            }
+            // Moving the history's base forward can mean replaying a long
+            // log: it runs on its own, and writes go on meanwhile.
+            if writer.history_due().await && !self.shared.maintaining.swap(true, Ordering::SeqCst) {
+                let (db, session) = (self.clone(), session.clone());
+                tokio::spawn(async move {
+                    if let Session::Writer(writer) = session.as_ref() {
+                        let done = match db.scratch() {
+                            Ok(scratch) => writer.maintain_history(scratch.store().clone()).await,
+                            Err(e) => Err(e),
+                        };
+                        if let Err(e) = done {
+                            tracing::warn!(database = %db.shared.name, error = %e, "could not move the history forward");
+                        }
+                    }
+                    db.shared.maintaining.store(false, Ordering::SeqCst);
+                });
             }
         }
     }

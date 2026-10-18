@@ -272,13 +272,29 @@ pub struct PartRef {
     pub checksum: u32,
 }
 
-/// A generation that has been replaced and is waiting to be deleted.
+/// A generation that has been replaced. It is kept while replicas that are
+/// behind may still read its log, and while it is part of the history that
+/// restores are made from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Superseded {
     /// The old generation number.
     pub generation: u64,
     /// When it was replaced, in milliseconds since the Unix epoch.
     pub at_ms: u64,
+    /// The LSN its snapshot was taken at. Absent in manifests written before
+    /// history was kept; such a generation is not part of the history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_lsn: Option<Lsn>,
+    /// When its snapshot was installed, in milliseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_ms: Option<u64>,
+    /// Its snapshot's parts, while the snapshot is kept for restores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_parts: Option<Vec<PartRef>>,
+    /// Its snapshot was installed by a restore: no log leads to it, so it is
+    /// kept as long as the generation is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restored: bool,
 }
 
 /// `manifest.json`: names the current generation of a database.
@@ -302,6 +318,14 @@ pub struct Manifest {
     /// Hex-encoded sealed marker, present when values are encrypted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_check: Option<String>,
+    /// When the current snapshot was installed, in milliseconds since the
+    /// Unix epoch. Absent in older manifests and for generation 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_ms: Option<u64>,
+    /// The current snapshot was installed by a restore or a branch, not
+    /// taken at the tail of the previous generation's log.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restored: bool,
 }
 
 impl Manifest {
@@ -315,6 +339,8 @@ impl Manifest {
             owner_epoch: 0,
             superseded: Vec::new(),
             encryption_check: None,
+            snapshot_ms: None,
+            restored: false,
         }
     }
 
