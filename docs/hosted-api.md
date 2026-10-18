@@ -60,6 +60,35 @@ tokens. `ttl_seconds` is 60 to 86,400 (default 3,600). `subject` is optional and
 recorded in the token for your own reference. A token stops working when it expires
 or when the API key that minted it is revoked. A token cannot mint tokens.
 
+`prefixes` limits a token to keys under them, for data shared by a team where each
+user may see only part of it:
+
+```json
+{ "scope": "write", "prefixes": ["teams/42/", "users/alice/"] }
+```
+
+At most 16, each 1 to 1,024 bytes of UTF-8 text. Such a token reads, writes and scans
+only those keys; anything else is `403` `FORBIDDEN`. A replica using it must be a
+partial copy within them (see below): following a database with it asks the service
+for those prefixes, and asking for more, or for the whole database, is refused.
+
+## Partial copies
+
+A copy can hold only some prefixes:
+
+```rust
+let team = kv.database("workspace").prefixes(["teams/42/"]).open().await?;
+team.get(b"teams/42/board")?;        // local, as usual
+team.get(b"teams/7/board");          // Err: NOT_REPLICATED
+team.fetch(b"teams/7/board").await?; // from the service, if the credential allows it
+```
+
+The service sends only keys under the prefixes, in the log and in the snapshot, so a
+partial copy downloads, stores and is sent only what it holds. Reads, scans, watches and
+writes outside them fail with `NOT_REPLICATED`; a scan must lie inside one prefix. With
+a hosted service the prefixes must be UTF-8 text. Opening the copy again with other
+prefixes downloads it again. A database opened for ingestion cannot also be partial.
+
 On the replica, give the library a way to get tokens from your backend instead of a key:
 
 ```rust
@@ -181,6 +210,13 @@ pushed yet are kept through a rebuild.
 **Snapshot.** If a newer snapshot replaces the one being downloaded, a part request
 answers `409` with code `SNAPSHOT_CHANGED` and the client starts over from the listing.
 
+**Partial copies.** A partial copy adds `prefix={prefix}` to `GET /log` and
+`GET /snapshot`, once per prefix. The service then keeps only operations on keys under
+them: every frame is still sent, so LSNs stay continuous, but it may hold no
+operations. The snapshot listing's part URLs carry the same prefixes, and each part is
+filtered when it is downloaded, so the listing leaves out `size` and `checksum`; the
+client checks the checksum each part ends with instead. Watermarks are kept.
+
 ## Errors
 
 A failed request carries a code in the `x-edgekv-error` header and in the body:
@@ -195,7 +231,7 @@ The library turns these into `ValkvEdgeError`, and `code()` returns the same str
 |---|---|
 | `UNAUTHENTICATED` | The API key or token is missing, wrong or revoked |
 | `TOKEN_EXPIRED` | The token has expired; with `remote_with_tokens` the library gets a new one and retries |
-| `FORBIDDEN` | The key may not do this, for example a read-only key or token writing |
+| `FORBIDDEN` | The key may not do this, for example a read-only key or token writing, or a token used outside its prefixes |
 | `CONDITION_FAILED` | A conditional write found a key at another version; nothing was written |
 | `NOT_FOUND` | No such database for this key |
 | `ACCOUNT_SUSPENDED` | The account cannot be used at the moment |

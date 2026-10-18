@@ -4,6 +4,7 @@
 //! The API is described in `docs/hosted-api.md`.
 
 use crate::local::LocalStore;
+use crate::prefixes::Prefixes;
 use crate::{Auth, Version};
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
 use base64::Engine;
@@ -44,6 +45,8 @@ pub(crate) struct Client {
     replica: ReplicaId,
     /// Bound on a commit or a push.
     write_timeout: Duration,
+    /// For a partial copy, the prefixes it asks the service for.
+    prefixes: Option<Prefixes>,
 }
 
 /// When a token expires, read from its `exp` claim without checking the
@@ -151,6 +154,7 @@ impl Client {
         database: &str,
         replica: ReplicaId,
         write_timeout: Duration,
+        prefixes: Option<Prefixes>,
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -164,7 +168,23 @@ impl Client {
             token: tokio::sync::Mutex::new(None),
             replica,
             write_timeout,
+            prefixes,
         })
+    }
+
+    /// The database's URL with `path` appended and, for a partial copy, a
+    /// `prefix` parameter for each prefix it holds, so the service sends
+    /// only those keys.
+    fn partial_url(&self, path: &str) -> Result<reqwest::Url> {
+        let mut url = self.url(path)?;
+        if let Some(prefixes) = &self.prefixes {
+            let mut query = url.query_pairs_mut();
+            for prefix in prefixes.as_slice() {
+                // Checked to be UTF-8 when the database was opened.
+                query.append_pair("prefix", &String::from_utf8_lossy(prefix));
+            }
+        }
+        Ok(url)
     }
 
     /// The credential for the next request: the API key, or a token that
@@ -451,14 +471,13 @@ impl Client {
     pub(crate) async fn log(&self, after: Lsn, wait: Option<Duration>) -> Result<LogPage> {
         // `after` is how far this replica has read: with the replica header,
         // the service knows how far behind it is.
-        let url = match wait {
-            Some(wait) => format!(
-                "{}/log?after={after}&wait_ms={}",
-                self.base,
-                wait.as_millis()
-            ),
-            None => format!("{}/log?after={after}", self.base),
-        };
+        let mut url = self.partial_url("log")?;
+        url.query_pairs_mut()
+            .append_pair("after", &after.to_string());
+        if let Some(wait) = wait {
+            url.query_pairs_mut()
+                .append_pair("wait_ms", &wait.as_millis().to_string());
+        }
         let request = self
             .http
             .get(url)
@@ -499,7 +518,7 @@ impl Client {
         for _ in 0..5 {
             let listing = self
                 .json(
-                    self.http.get(format!("{}/snapshot", self.base)),
+                    self.http.get(self.partial_url("snapshot")?),
                     self.write_timeout,
                 )
                 .await?;
@@ -512,7 +531,14 @@ impl Client {
             let mut changed = false;
             for part in listing["parts"].as_array().ok_or_else(malformed)? {
                 let url = part["url"].as_str().ok_or_else(malformed)?;
-                let checksum = part["checksum"].as_u64().ok_or_else(malformed)? as u32;
+                // Parts filtered for a partial copy are made when they are
+                // downloaded, so the listing cannot know their checksum:
+                // each part's own checksum is checked instead.
+                let checksum = match part["checksum"].as_u64() {
+                    Some(checksum) => Some(checksum as u32),
+                    None if self.prefixes.is_some() => None,
+                    None => return Err(malformed()),
+                };
                 let request = self.http.get(format!("{origin}{url}"));
                 let bytes = match self.send(request, DOWNLOAD_TIMEOUT).await {
                     Ok(response) => response
@@ -527,6 +553,10 @@ impl Client {
                         break;
                     }
                     Err(e) => return Err(e),
+                };
+                let checksum = match checksum {
+                    Some(checksum) => checksum,
+                    None => own_checksum(&bytes)?,
                 };
                 state.load(&decode_snapshot_part(&bytes, checksum)?)?;
             }
@@ -562,6 +592,17 @@ impl Client {
             }
         }
     }
+}
+
+/// The checksum a snapshot part ends with, which decoding then verifies
+/// against the part's contents.
+fn own_checksum(part: &[u8]) -> Result<u32> {
+    let tail = part
+        .len()
+        .checked_sub(4)
+        .map(|start| &part[start..])
+        .ok_or_else(|| Error::corrupt("snapshot part too short"))?;
+    Ok(u32::from_le_bytes(tail.try_into().expect("len 4")))
 }
 
 /// Applies frames read after `applied` to the local copy.
