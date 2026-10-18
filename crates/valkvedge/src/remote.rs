@@ -286,11 +286,15 @@ impl Client {
         let ops: Vec<Value> = changes
             .iter()
             .map(|c| {
-                json!({
+                let mut op = json!({
                     "op": kind_name(c.kind),
                     "key": B64.encode(&c.key),
                     "value": B64.encode(&c.value),
-                })
+                });
+                if let (OpKind::Put, Some(ms)) = (c.kind, c.expires_ms) {
+                    op["expires_at"] = rfc3339(ms).into();
+                }
+                op
             })
             .collect();
         let mut body = json!({ "ops": ops });
@@ -334,12 +338,16 @@ impl Client {
                     .ops
                     .iter()
                     .map(|op| {
-                        json!({
+                        let mut json = json!({
                             "op": kind_name(op.kind),
                             "key": B64.encode(&op.key),
                             "value": B64.encode(&op.value),
                             "hlc": { "ms": op.hlc.physical_ms, "counter": op.hlc.counter },
-                        })
+                        });
+                        if let (OpKind::Put, Some(ms)) = (op.kind, op.expires_ms) {
+                            json["expires_at"] = rfc3339(ms).into();
+                        }
+                        json
                     })
                     .collect();
                 json!({ "seq": entry.seq, "ops": ops })

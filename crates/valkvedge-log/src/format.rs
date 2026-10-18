@@ -6,8 +6,22 @@ use crate::error::{Error, Result};
 use crate::types::{put_bytes, Dec, Frame, Hlc, Lsn, ReplicaId};
 use serde::{Deserialize, Serialize};
 
-/// Highest format version this build reads and the version it writes.
-pub const FORMAT_VERSION: u16 = 1;
+/// Highest format version this build reads.
+pub const FORMAT_VERSION: u16 = 2;
+
+/// The version written, unless an object holds something version 1 cannot
+/// express: a value that expires (version 2). Objects without one stay
+/// readable by builds that know only version 1.
+pub const BASE_VERSION: u16 = 1;
+
+/// The version of an object that holds an expiring value or not.
+fn version_for(expiring: bool) -> u16 {
+    if expiring {
+        2
+    } else {
+        BASE_VERSION
+    }
+}
 
 const SEGMENT_MAGIC: &[u8; 4] = b"VKSG";
 const SNAPSHOT_MAGIC: &[u8; 4] = b"VKSN";
@@ -70,7 +84,11 @@ impl Segment {
     pub fn encode(&self) -> (Vec<u8>, u32) {
         let mut out = Vec::new();
         out.extend_from_slice(SEGMENT_MAGIC);
-        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        let expiring = self
+            .frames
+            .iter()
+            .any(|f| f.ops.iter().any(|op| op.expires_ms.is_some()));
+        out.extend_from_slice(&version_for(expiring).to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&self.first_lsn.to_le_bytes());
         out.extend_from_slice(&self.last_lsn.to_le_bytes());
@@ -156,6 +174,9 @@ pub enum Record {
         hlc: Hlc,
         /// True when the key was deleted.
         tombstone: bool,
+        /// When the value expires, in milliseconds since the Unix epoch.
+        /// `None`: never.
+        expires_ms: Option<u64>,
     },
     /// The highest outbox sequence number applied for a replica.
     Watermark {
@@ -175,12 +196,16 @@ impl Record {
                 value,
                 hlc,
                 tombstone,
+                expires_ms,
             } => {
-                out.push(0);
+                out.push(if expires_ms.is_some() { 2 } else { 0 });
                 out.push(u8::from(*tombstone));
                 hlc.encode(out);
                 put_bytes(out, key);
                 put_bytes(out, value);
+                if let Some(ms) = expires_ms {
+                    out.extend_from_slice(&ms.to_le_bytes());
+                }
             }
             Record::Watermark { replica, seq } => {
                 out.push(1);
@@ -192,14 +217,18 @@ impl Record {
 
     fn decode(dec: &mut Dec<'_>) -> Result<Self> {
         match dec.u8()? {
-            0 => {
+            tag @ (0 | 2) => {
                 let tombstone = dec.u8()? != 0;
                 let hlc = Hlc::decode(dec)?;
+                let key = dec.bytes()?.to_vec();
+                let value = dec.bytes()?.to_vec();
+                let expires_ms = if tag == 2 { Some(dec.u64()?) } else { None };
                 Ok(Record::Entry {
-                    key: dec.bytes()?.to_vec(),
-                    value: dec.bytes()?.to_vec(),
+                    key,
+                    value,
                     hlc,
                     tombstone,
+                    expires_ms,
                 })
             }
             1 => Ok(Record::Watermark {
@@ -223,7 +252,16 @@ impl Record {
 pub fn encode_snapshot_part(part: u32, records: &[Record]) -> (Vec<u8>, u32) {
     let mut out = Vec::new();
     out.extend_from_slice(SNAPSHOT_MAGIC);
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    let expiring = records.iter().any(|r| {
+        matches!(
+            r,
+            Record::Entry {
+                expires_ms: Some(_),
+                ..
+            }
+        )
+    });
+    out.extend_from_slice(&version_for(expiring).to_le_bytes());
     out.extend_from_slice(&part.to_le_bytes());
     out.extend_from_slice(&(records.len() as u32).to_le_bytes());
     for record in records {
@@ -332,7 +370,7 @@ impl Manifest {
     /// The manifest of a database that has just been created.
     pub fn empty() -> Self {
         Manifest {
-            format_version: FORMAT_VERSION,
+            format_version: BASE_VERSION,
             generation: 0,
             snapshot_lsn: 0,
             snapshot_parts: Vec::new(),
@@ -437,6 +475,7 @@ mod tests {
                 key: format!("k{lsn}").into_bytes(),
                 value: b"v".to_vec(),
                 hlc: Hlc::default(),
+                expires_ms: None,
             }],
         }
     }
@@ -481,6 +520,30 @@ mod tests {
     }
 
     #[test]
+    fn version_2_is_written_only_for_values_that_expire() {
+        let version = |bytes: &[u8]| u16::from_le_bytes([bytes[4], bytes[5]]);
+        let (plain, _) = Segment::new(0, vec![frame(1)]).encode();
+        assert_eq!(version(&plain), 1, "readable by builds that know only 1");
+        let mut expiring = frame(1);
+        expiring.ops[0].expires_ms = Some(1_700_000_000_000);
+        let seg = Segment::new(0, vec![expiring]);
+        let (bytes, _) = seg.encode();
+        assert_eq!(version(&bytes), 2);
+        assert_eq!(Segment::decode(&bytes).unwrap().0, seg);
+
+        let entry = |expires_ms| Record::Entry {
+            key: b"a".to_vec(),
+            value: b"1".to_vec(),
+            hlc: Hlc::default(),
+            tombstone: false,
+            expires_ms,
+        };
+        assert_eq!(version(&encode_snapshot_part(0, &[entry(None)]).0), 1);
+        assert_eq!(version(&encode_snapshot_part(0, &[entry(Some(5))]).0), 2);
+        assert_eq!(Manifest::empty().format_version, 1);
+    }
+
+    #[test]
     fn snapshot_part_round_trips_and_checks_expected_checksum() {
         let records = vec![
             Record::Entry {
@@ -488,12 +551,14 @@ mod tests {
                 value: b"1".to_vec(),
                 hlc: Hlc::default(),
                 tombstone: false,
+                expires_ms: Some(1_700_000_000_000),
             },
             Record::Entry {
                 key: b"b".to_vec(),
                 value: vec![],
                 hlc: Hlc::default(),
                 tombstone: true,
+                expires_ms: None,
             },
             Record::Watermark {
                 replica: ReplicaId([3; 16]),

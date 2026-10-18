@@ -163,6 +163,11 @@ fn kind(value: &Value) -> OpKind {
     }
 }
 
+/// An operation's `expires_at`, in milliseconds since the Unix epoch.
+fn expires(op: &Value) -> Option<u64> {
+    op["expires_at"].as_str().and_then(parse_rfc3339)
+}
+
 async fn commit(
     State(server): Shared,
     Path(database): Path<String>,
@@ -175,9 +180,15 @@ async fn commit(
     };
     let mut batch = db.batch();
     for op in body["ops"].as_array().cloned().unwrap_or_default() {
-        match kind(&op["op"]) {
-            OpKind::Put => batch.put(&decode(&op["key"]), &decode(&op["value"])),
-            OpKind::Delete => batch.delete(&decode(&op["key"])),
+        let (key, value) = (decode(&op["key"]), decode(&op["value"]));
+        match (kind(&op["op"]), expires(&op)) {
+            (OpKind::Put, None) => batch.put(&key, &value),
+            (OpKind::Put, Some(ms)) => batch.put_expiring(
+                &key,
+                &value,
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms),
+            ),
+            (OpKind::Delete, _) => batch.delete(&key),
         };
     }
     for condition in body["conditions"].as_array().cloned().unwrap_or_default() {
@@ -253,6 +264,7 @@ async fn push(
                         counter: op["hlc"]["counter"].as_u64().unwrap_or(0) as u32,
                         replica,
                     },
+                    expires_ms: expires(op),
                 })
                 .collect(),
         })
@@ -1826,4 +1838,44 @@ async fn a_replica_asks_the_service_to_restore_and_every_copy_reloads() {
 
     let err = a.restore(valkvedge::Point::Lsn(10)).await.unwrap_err();
     assert_eq!(err.code(), "NOT_IN_HISTORY");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expiry_travels_through_the_service_and_its_writer_deletes_the_value() {
+    let [sdir, adir, bdir] = dirs();
+    let service = service(&sdir).await;
+    let a = replica(&adir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    let ttl = Duration::from_secs(2);
+    a.put_with_ttl(b"sync", b"1", ttl).await.unwrap();
+    let mut buffered = a.batch();
+    buffered.put_with_ttl(b"buffered", b"2", ttl);
+    buffered.commit_with(Durability::Buffered).await.unwrap();
+    a.flush().await.unwrap();
+    let (sync_at, buffered_at) = (
+        a.expires_at(b"sync").unwrap().expect("expires"),
+        a.expires_at(b"buffered").unwrap().expect("expires"),
+    );
+
+    // Another replica gets the expiry with the values.
+    let b = replica(&bdir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(b.expires_at(b"sync").unwrap(), Some(sync_at));
+    assert_eq!(b.expires_at(b"buffered").unwrap(), Some(buffered_at));
+
+    tokio::time::sleep(ttl + Duration::from_millis(100)).await;
+    assert_eq!(b.get(b"sync").unwrap(), None);
+    assert_eq!(b.get(b"buffered").unwrap(), None);
+    // The service's writer deletes them; the replicas only read.
+    assert_eq!(a.expire().await.unwrap(), 0);
+    let owner = service.server.kv.database("app").open().await.unwrap();
+    assert_eq!(owner.expire().await.unwrap(), 2);
+    let lsn = owner.status().unwrap().applied_lsn;
+    assert_eq!(b.sync().await.unwrap(), lsn);
 }

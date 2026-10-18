@@ -324,6 +324,27 @@ The manager keeps at most
 Closing a store to make room does not release its lease: the process is still alive and
 still the owner. `ValkvEdge::close` releases leases.
 
+## Values that expire
+
+`put_with_ttl` (or `Batch::put_expiring` with a time) stores a value with an expiry. The
+expiry travels with the operation: in the outbox, in the log (operation kind 2, see
+[format](format.md)), in snapshots and in every local copy.
+
+- **Reads.** Once the time has passed, every copy reads the key as absent by its own
+  clock: `get`, scans, `expires_at`. A condition treats it as having no value, so
+  `if_absent` and `update` can write it again at once.
+- **Deletion.** The writer deletes expired values with ordinary deletes, at most 1,000
+  per commit, from the background task every `push_interval`, or when
+  `Database::expire` is called. Each delete is conditioned on the key still having no
+  live value, so a key written again in the meantime is left alone. Replicas, watchers
+  and change feeds see the delete like any other. The deleted value stays in the
+  history for the history window, like any delete.
+- **Finding them.** A local index orders expiring keys by time. Rows are added as values
+  are applied, and dropped lazily once they no longer match their key's value.
+- **Writing again** replaces the expiry: a plain `put` keeps the value for good.
+- **Encryption.** The expiry is stored beside the value, not sealed with it, like the
+  timestamp: the writer must be able to see it without the key.
+
 ## Encryption
 
 With a key, each value is sealed with ChaCha20-Poly1305 under a random nonce before it

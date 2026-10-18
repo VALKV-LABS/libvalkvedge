@@ -70,6 +70,12 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// True when a value that expires at `expires_ms` (milliseconds since the
+/// Unix epoch; `None`: never) has expired at `now_ms`.
+pub fn has_expired(expires_ms: Option<u64>, now_ms: u64) -> bool {
+    expires_ms.is_some_and(|at| at <= now_ms)
+}
+
 /// Produces strictly increasing [`Hlc`] timestamps for one replica.
 #[derive(Debug)]
 pub struct HlcClock {
@@ -136,38 +142,56 @@ pub struct Op {
     pub value: Vec<u8>,
     /// When the operation happened.
     pub hlc: Hlc,
+    /// When a put's value expires, in milliseconds since the Unix epoch.
+    /// `None`: never. Always `None` for a delete.
+    pub expires_ms: Option<u64>,
 }
 
 impl Op {
     /// Appends the encoding to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        out.push(match self.kind {
-            OpKind::Put => 0,
-            OpKind::Delete => 1,
+        out.push(match (self.kind, self.expires_ms) {
+            (OpKind::Put, None) => 0,
+            (OpKind::Delete, _) => 1,
+            (OpKind::Put, Some(_)) => 2,
         });
         put_bytes(out, &self.key);
         put_bytes(out, &self.value);
         self.hlc.encode(out);
+        if let (OpKind::Put, Some(ms)) = (self.kind, self.expires_ms) {
+            out.extend_from_slice(&ms.to_le_bytes());
+        }
     }
 
     /// Reads one operation from `dec`.
     pub fn decode(dec: &mut Dec<'_>) -> Result<Self> {
-        let kind = match dec.u8()? {
-            0 => OpKind::Put,
+        let tag = dec.u8()?;
+        let kind = match tag {
+            0 | 2 => OpKind::Put,
             1 => OpKind::Delete,
             other => return Err(Error::corrupt(format!("unknown op kind {other}"))),
         };
+        let key = dec.bytes()?.to_vec();
+        let value = dec.bytes()?.to_vec();
+        let hlc = Hlc::decode(dec)?;
+        let expires_ms = if tag == 2 { Some(dec.u64()?) } else { None };
         Ok(Op {
             kind,
-            key: dec.bytes()?.to_vec(),
-            value: dec.bytes()?.to_vec(),
-            hlc: Hlc::decode(dec)?,
+            key,
+            value,
+            hlc,
+            expires_ms,
         })
     }
 
     /// Encoded size in bytes.
     pub fn encoded_len(&self) -> usize {
-        1 + 4 + self.key.len() + 4 + self.value.len() + Hlc::SIZE
+        1 + 4
+            + self.key.len()
+            + 4
+            + self.value.len()
+            + Hlc::SIZE
+            + if self.expires_ms.is_some() { 8 } else { 0 }
     }
 }
 
@@ -381,12 +405,14 @@ mod tests {
                     key: b"k1".to_vec(),
                     value: b"v1".to_vec(),
                     hlc: hlc(999, 0, 9),
+                    expires_ms: Some(1_700_000_000_000),
                 },
                 Op {
                     kind: OpKind::Delete,
                     key: b"k2".to_vec(),
                     value: vec![],
                     hlc: hlc(999, 1, 9),
+                    expires_ms: None,
                 },
             ],
         };
@@ -408,6 +434,7 @@ mod tests {
                 key: b"key".to_vec(),
                 value: b"value".to_vec(),
                 hlc: hlc(1, 0, 1),
+                expires_ms: None,
             }],
         };
         let mut buf = Vec::new();
@@ -424,6 +451,7 @@ mod tests {
             key: b"a".to_vec(),
             value: vec![0u8; 100],
             hlc: hlc(5, 5, 5),
+            expires_ms: Some(42),
         }];
         assert_eq!(decode_ops(&encode_ops(&ops)).unwrap(), ops);
     }

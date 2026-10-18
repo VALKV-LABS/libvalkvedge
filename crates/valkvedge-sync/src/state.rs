@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
-use valkvedge_log::{ChainPos, Frame, Hlc, OpKind, Record, ReplicaId, Result};
+use valkvedge_log::{has_expired, now_ms, ChainPos, Frame, Hlc, OpKind, Record, ReplicaId, Result};
 
 /// The materialized state of one database: every key's latest value and
 /// timestamp, the per-replica push watermarks, and the log position that state
@@ -27,8 +27,8 @@ pub trait StateStore: Send + Sync + 'static {
     fn version_of(&self, key: &[u8]) -> Result<Option<Hlc>>;
 
     /// Timestamp of the value `key` holds now: `None` when the key was never
-    /// written or its latest operation is a delete. Conditional writes are
-    /// checked against this.
+    /// written, its latest operation is a delete, or its value has expired.
+    /// Conditional writes are checked against this.
     fn live_version(&self, key: &[u8]) -> Result<Option<Hlc>>;
 
     /// Highest outbox sequence number applied for `replica`, 0 if none.
@@ -51,13 +51,20 @@ pub trait StateStore: Send + Sync + 'static {
     /// Removes tombstones whose timestamp is older than `older_than_ms`.
     /// Returns how many were removed.
     fn purge_tombstones(&self, older_than_ms: u64) -> Result<u64>;
+
+    /// Keys whose value had expired by `now_ms` and has not been deleted, at
+    /// most `limit`. The writer deletes them.
+    fn expired(&self, now_ms: u64, limit: usize) -> Result<Vec<Vec<u8>>>;
 }
+
+/// One key in a [`MemState`]: value, timestamp, tombstone, expiry.
+type MemEntry = (Vec<u8>, Hlc, bool, Option<u64>);
 
 #[derive(Debug, Default)]
 struct MemInner {
     pos: ChainPos,
     resetting: bool,
-    data: BTreeMap<Vec<u8>, (Vec<u8>, Hlc, bool)>,
+    data: BTreeMap<Vec<u8>, MemEntry>,
     watermarks: HashMap<ReplicaId, u64>,
 }
 
@@ -73,11 +80,13 @@ impl MemState {
         Self::default()
     }
 
-    /// The live value of `key`, if any.
+    /// The live value of `key`, if any: not deleted and not expired.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let inner = self.inner.lock().expect("mem state lock");
         match inner.data.get(key) {
-            Some((value, _, false)) => Some(value.clone()),
+            Some((value, _, false, expires)) if !has_expired(*expires, now_ms()) => {
+                Some(value.clone())
+            }
             _ => None,
         }
     }
@@ -105,9 +114,10 @@ impl StateStore for MemState {
             }
             for op in &frame.ops {
                 let tombstone = op.kind == OpKind::Delete;
-                inner
-                    .data
-                    .insert(op.key.clone(), (op.value.clone(), op.hlc, tombstone));
+                inner.data.insert(
+                    op.key.clone(),
+                    (op.value.clone(), op.hlc, tombstone, op.expires_ms),
+                );
             }
             if let Some(origin) = frame.origin {
                 let mark = inner.watermarks.entry(origin.replica).or_insert(0);
@@ -120,13 +130,13 @@ impl StateStore for MemState {
 
     fn version_of(&self, key: &[u8]) -> Result<Option<Hlc>> {
         let inner = self.inner.lock().expect("mem state lock");
-        Ok(inner.data.get(key).map(|(_, hlc, _)| *hlc))
+        Ok(inner.data.get(key).map(|(_, hlc, _, _)| *hlc))
     }
 
     fn live_version(&self, key: &[u8]) -> Result<Option<Hlc>> {
         let inner = self.inner.lock().expect("mem state lock");
         Ok(match inner.data.get(key) {
-            Some((_, hlc, false)) => Some(*hlc),
+            Some((_, hlc, false, expires)) if !has_expired(*expires, now_ms()) => Some(*hlc),
             _ => None,
         })
     }
@@ -154,10 +164,11 @@ impl StateStore for MemState {
                     value,
                     hlc,
                     tombstone,
+                    expires_ms,
                 } => {
                     inner
                         .data
-                        .insert(key.clone(), (value.clone(), *hlc, *tombstone));
+                        .insert(key.clone(), (value.clone(), *hlc, *tombstone, *expires_ms));
                 }
                 Record::Watermark { replica, seq } => {
                     inner.watermarks.insert(*replica, *seq);
@@ -179,12 +190,13 @@ impl StateStore for MemState {
             let inner = self.inner.lock().expect("mem state lock");
             (inner.data.clone(), inner.watermarks.clone())
         };
-        for (key, (value, hlc, tombstone)) in entries {
+        for (key, (value, hlc, tombstone, expires_ms)) in entries {
             visit(Record::Entry {
                 key,
                 value,
                 hlc,
                 tombstone,
+                expires_ms,
             })?;
         }
         for (replica, seq) in marks {
@@ -198,7 +210,18 @@ impl StateStore for MemState {
         let before = inner.data.len();
         inner
             .data
-            .retain(|_, (_, hlc, tombstone)| !(*tombstone && hlc.physical_ms < older_than_ms));
+            .retain(|_, (_, hlc, tombstone, _)| !(*tombstone && hlc.physical_ms < older_than_ms));
         Ok((before - inner.data.len()) as u64)
+    }
+
+    fn expired(&self, now_ms: u64, limit: usize) -> Result<Vec<Vec<u8>>> {
+        let inner = self.inner.lock().expect("mem state lock");
+        Ok(inner
+            .data
+            .iter()
+            .filter(|(_, (_, _, tombstone, expires))| !tombstone && has_expired(*expires, now_ms))
+            .map(|(key, _)| key.clone())
+            .take(limit)
+            .collect())
     }
 }

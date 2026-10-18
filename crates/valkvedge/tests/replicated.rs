@@ -372,6 +372,7 @@ async fn the_writer_accepts_pushed_entries_from_other_replicas() {
             counter: 0,
             replica: phone,
         },
+        expires_ms: None,
     };
     let entries = vec![OutboxEntry {
         seq: 1,

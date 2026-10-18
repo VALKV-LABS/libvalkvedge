@@ -166,6 +166,9 @@ pub struct Change {
     pub key: Vec<u8>,
     /// The stored value. Empty for deletes.
     pub value: Vec<u8>,
+    /// When a put's value expires, in milliseconds since the Unix epoch.
+    /// `None`: never. Ignored for deletes.
+    pub expires_ms: Option<u64>,
 }
 
 /// A requirement on one key for [`Writer::commit_if`].
@@ -380,6 +383,38 @@ impl<S: StateStore> Writer<S> {
         }
     }
 
+    /// Deletes values that had expired by `now_ms`, at most `limit` at a
+    /// time, as one ordinary commit. Each delete holds only while its key
+    /// still has no live value, so a key written again in the meantime is
+    /// left alone. Returns how many keys were deleted.
+    pub async fn expire(&self, now_ms: u64, limit: usize) -> Result<usize> {
+        let mut keys = self.state.expired(now_ms, limit)?;
+        while !keys.is_empty() {
+            let changes = keys
+                .iter()
+                .map(|key| Change {
+                    kind: OpKind::Delete,
+                    key: key.clone(),
+                    value: Vec::new(),
+                    expires_ms: None,
+                })
+                .collect();
+            let conditions: Vec<Condition> = keys
+                .iter()
+                .map(|key| Condition {
+                    key: key.clone(),
+                    version: None,
+                })
+                .collect();
+            match self.commit_if(changes, &conditions).await {
+                Ok(_) => return Ok(keys.len()),
+                Err(Error::ConditionFailed { key }) => keys.retain(|k| *k != key),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(0)
+    }
+
     /// The commits for the next segment: the oldest waiting, up to
     /// `max_group_bytes`, and always at least one. Commits whose caller has
     /// given up are dropped unwritten.
@@ -483,6 +518,7 @@ impl<S: StateStore> Writer<S> {
         let ops: Vec<Op> = changes
             .into_iter()
             .map(|c| Op {
+                expires_ms: c.expires_ms.filter(|_| c.kind == OpKind::Put),
                 kind: c.kind,
                 key: c.key,
                 value: c.value,

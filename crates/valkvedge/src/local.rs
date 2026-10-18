@@ -10,7 +10,9 @@ use std::ops::Bound;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use valkvedge_log::types::{decode_ops, encode_ops, Dec};
-use valkvedge_log::{ChainPos, Error, Frame, Hlc, Lsn, Op, OpKind, Record, ReplicaId, Result};
+use valkvedge_log::{
+    has_expired, now_ms, ChainPos, Error, Frame, Hlc, Lsn, Op, OpKind, Record, ReplicaId, Result,
+};
 use valkvedge_sync::{Change, Condition, OutboxEntry, StateStore};
 
 /// What changed in what a reader sees, announced after each local write.
@@ -53,6 +55,10 @@ pub(crate) struct LocalStore {
     replicas: Keyspace,
     outbox: Keyspace,
     overlay: Keyspace,
+    /// Values that expire, by when: rows of [`expiry_row`]. A row is not
+    /// removed when its value is overwritten; [`StateStore::expired`] drops
+    /// rows that no longer match their value.
+    expiry: Keyspace,
     persist: Option<PersistMode>,
     // Serializes read-modify-write sequences. Fjall itself is thread-safe.
     write: Mutex<()>,
@@ -62,19 +68,65 @@ pub(crate) struct LocalStore {
     prefixes: Option<Prefixes>,
 }
 
-fn encode_entry(tombstone: bool, hlc: &Hlc, value: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + Hlc::SIZE + value.len());
-    out.push(u8::from(tombstone));
+/// A stored entry: `0` and the timestamp then the value; `1` and the
+/// timestamp for a tombstone; `2`, the timestamp, when it expires (`u64`)
+/// then the value, for a value that expires.
+fn encode_entry(tombstone: bool, hlc: &Hlc, expires_ms: Option<u64>, value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + Hlc::SIZE + 8 + value.len());
+    match (tombstone, expires_ms) {
+        (true, _) => out.push(1),
+        (false, None) => out.push(0),
+        (false, Some(_)) => out.push(2),
+    }
     hlc.encode(&mut out);
+    if let (false, Some(ms)) = (tombstone, expires_ms) {
+        out.extend_from_slice(&ms.to_le_bytes());
+    }
     out.extend_from_slice(value);
     out
 }
 
-fn decode_entry(bytes: &[u8]) -> Result<(bool, Hlc, &[u8])> {
+/// A decoded entry: tombstone, timestamp, expiry and value.
+struct Entry<'a> {
+    tombstone: bool,
+    hlc: Hlc,
+    expires_ms: Option<u64>,
+    value: &'a [u8],
+}
+
+impl Entry<'_> {
+    /// Holds a value that has not expired.
+    fn live(&self, now_ms: u64) -> bool {
+        !self.tombstone && !has_expired(self.expires_ms, now_ms)
+    }
+}
+
+fn decode_entry(bytes: &[u8]) -> Result<Entry<'_>> {
     let mut dec = Dec::new(bytes);
-    let tombstone = dec.u8()? != 0;
+    let tag = dec.u8()?;
     let hlc = Hlc::decode(&mut dec)?;
-    Ok((tombstone, hlc, &bytes[dec.position()..]))
+    let expires_ms = if tag == 2 { Some(dec.u64()?) } else { None };
+    Ok(Entry {
+        tombstone: tag == 1,
+        hlc,
+        expires_ms,
+        value: &bytes[dec.position()..],
+    })
+}
+
+/// A value as a reader sees it: stored bytes (sealed if the database is
+/// encrypted), timestamp and expiry.
+pub(crate) struct Live {
+    pub value: Vec<u8>,
+    pub hlc: Hlc,
+    pub expires_ms: Option<u64>,
+}
+
+/// The key of a value's row in the expiry index: when it expires, then the key.
+fn expiry_row(expires_ms: u64, key: &[u8]) -> Vec<u8> {
+    let mut row = expires_ms.to_be_bytes().to_vec();
+    row.extend_from_slice(key);
+    row
 }
 
 fn encode_pos(pos: &ChainPos) -> Vec<u8> {
@@ -114,6 +166,7 @@ impl LocalStore {
             replicas: ks("devices")?,
             outbox: ks("outbox")?,
             overlay: ks("overlay")?,
+            expiry: ks("expiry")?,
             persist: fsync.then_some(PersistMode::SyncAll),
             write: Mutex::new(()),
             feed,
@@ -246,7 +299,12 @@ impl LocalStore {
         let mut batch = self.batch();
         for op in ops {
             let mut value = seq.to_le_bytes().to_vec();
-            value.extend_from_slice(&encode_entry(op.kind == OpKind::Delete, &op.hlc, &op.value));
+            value.extend_from_slice(&encode_entry(
+                op.kind == OpKind::Delete,
+                &op.hlc,
+                op.expires_ms,
+                &op.value,
+            ));
             batch.insert(&self.overlay, op.key.as_slice(), value);
         }
         stat.next_seq += 1;
@@ -308,7 +366,7 @@ impl LocalStore {
                         // the key reads the same. One that lost reads as
                         // the winner from here on.
                         if watched {
-                            let (_, pending_hlc, _) = decode_entry(&pending[8..])?;
+                            let pending_hlc = decode_entry(&pending[8..])?.hlc;
                             if self.version_of(&op.key)? != Some(pending_hlc) {
                                 changed.push(op.key.clone());
                             }
@@ -346,6 +404,7 @@ impl LocalStore {
         let ops: Vec<Op> = changes
             .into_iter()
             .map(|c| Op {
+                expires_ms: c.expires_ms.filter(|_| c.kind == OpKind::Put),
                 kind: c.kind,
                 key: c.key,
                 value: c.value,
@@ -371,19 +430,30 @@ impl LocalStore {
 
     /// [`LocalStore::get_stored`] with the timestamp of the value returned.
     pub(crate) fn get_stored_versioned(&self, key: &[u8]) -> Result<Option<(Vec<u8>, Hlc)>> {
+        Ok(self.get_live(key)?.map(|live| (live.value, live.hlc)))
+    }
+
+    /// The value `key` reads as now (a pending buffered write first), its
+    /// timestamp and when it expires. `None` when it has no value, or its
+    /// value has expired.
+    pub(crate) fn get_live(&self, key: &[u8]) -> Result<Option<Live>> {
+        let now = now_ms();
+        let read = |entry: Entry<'_>| {
+            entry.live(now).then(|| Live {
+                value: entry.value.to_vec(),
+                hlc: entry.hlc,
+                expires_ms: entry.expires_ms,
+            })
+        };
         if let Some(pending) = self.overlay.get(key).map_err(local)? {
             if pending.len() < 8 {
                 return Err(Error::corrupt("overlay entry"));
             }
-            let (tombstone, hlc, value) = decode_entry(&pending[8..])?;
-            return Ok((!tombstone).then(|| (value.to_vec(), hlc)));
+            return Ok(read(decode_entry(&pending[8..])?));
         }
         match self.data.get(key).map_err(local)? {
             None => Ok(None),
-            Some(stored) => {
-                let (tombstone, hlc, value) = decode_entry(&stored)?;
-                Ok((!tombstone).then(|| (value.to_vec(), hlc)))
-            }
+            Some(stored) => Ok(read(decode_entry(&stored)?)),
         }
     }
 
@@ -411,8 +481,12 @@ impl LocalStore {
         let mut changed = Vec::new();
         for frame in frames.iter().filter(|f| f.lsn > applied) {
             for op in frame.ops.iter().filter(|op| self.holds(&op.key)) {
-                let stored = encode_entry(op.kind == OpKind::Delete, &op.hlc, &op.value);
+                let tombstone = op.kind == OpKind::Delete;
+                let stored = encode_entry(tombstone, &op.hlc, op.expires_ms, &op.value);
                 batch.insert(&self.data, op.key.as_slice(), stored);
+                if let (false, Some(at)) = (tombstone, op.expires_ms) {
+                    batch.insert(&self.expiry, expiry_row(at, &op.key), []);
+                }
                 // A pending buffered write hides the replicated value, so
                 // the key reads the same until that write settles.
                 if watched && !self.has_pending(&op.key)? {
@@ -469,7 +543,7 @@ impl StateStore for LocalStore {
     fn version_of(&self, key: &[u8]) -> Result<Option<Hlc>> {
         match self.data.get(key).map_err(local)? {
             None => Ok(None),
-            Some(stored) => Ok(Some(decode_entry(&stored)?.1)),
+            Some(stored) => Ok(Some(decode_entry(&stored)?.hlc)),
         }
     }
 
@@ -477,8 +551,8 @@ impl StateStore for LocalStore {
         match self.data.get(key).map_err(local)? {
             None => Ok(None),
             Some(stored) => {
-                let (tombstone, hlc, _) = decode_entry(&stored)?;
-                Ok((!tombstone).then_some(hlc))
+                let entry = decode_entry(&stored)?;
+                Ok(entry.live(now_ms()).then_some(entry.hlc))
             }
         }
     }
@@ -499,6 +573,7 @@ impl StateStore for LocalStore {
         self.meta.insert(RESETTING, [1u8]).map_err(local)?;
         self.db.persist(PersistMode::SyncAll).map_err(local)?;
         self.data.clear().map_err(local)?;
+        self.expiry.clear().map_err(local)?;
         self.replicas.clear().map_err(local)
     }
 
@@ -512,11 +587,17 @@ impl StateStore for LocalStore {
                     value,
                     hlc,
                     tombstone,
-                } => batch.insert(
-                    &self.data,
-                    key.as_slice(),
-                    encode_entry(*tombstone, hlc, value),
-                ),
+                    expires_ms,
+                } => {
+                    batch.insert(
+                        &self.data,
+                        key.as_slice(),
+                        encode_entry(*tombstone, hlc, *expires_ms, value),
+                    );
+                    if let (false, Some(at)) = (tombstone, expires_ms) {
+                        batch.insert(&self.expiry, expiry_row(*at, key), []);
+                    }
+                }
                 Record::Watermark { replica, seq } => batch.insert(
                     &self.replicas,
                     replica.0.to_vec(),
@@ -541,12 +622,13 @@ impl StateStore for LocalStore {
     fn scan(&self, visit: &mut dyn FnMut(Record) -> Result<()>) -> Result<()> {
         for guard in self.data.iter() {
             let (key, stored) = guard.into_inner().map_err(local)?;
-            let (tombstone, hlc, value) = decode_entry(&stored)?;
+            let entry = decode_entry(&stored)?;
             visit(Record::Entry {
                 key: key.to_vec(),
-                value: value.to_vec(),
-                hlc,
-                tombstone,
+                value: entry.value.to_vec(),
+                hlc: entry.hlc,
+                tombstone: entry.tombstone,
+                expires_ms: entry.expires_ms,
             })?;
         }
         for guard in self.replicas.iter() {
@@ -573,8 +655,8 @@ impl StateStore for LocalStore {
         let mut expired = Vec::new();
         for guard in self.data.iter() {
             let (key, stored) = guard.into_inner().map_err(local)?;
-            let (tombstone, hlc, _) = decode_entry(&stored)?;
-            if tombstone && hlc.physical_ms < older_than_ms {
+            let entry = decode_entry(&stored)?;
+            if entry.tombstone && entry.hlc.physical_ms < older_than_ms {
                 expired.push(key.to_vec());
             }
         }
@@ -587,6 +669,49 @@ impl StateStore for LocalStore {
         }
         Ok(expired.len() as u64)
     }
+
+    fn expired(&self, now_ms: u64, limit: usize) -> Result<Vec<Vec<u8>>> {
+        let mut due = Vec::new();
+        let mut stale = Vec::new();
+        // Every row at or before `now_ms` sorts below the next millisecond.
+        let end = now_ms.saturating_add(1).to_be_bytes().to_vec();
+        for guard in self.expiry.range(..end) {
+            let row = guard.key().map_err(local)?;
+            if row.len() < 8 {
+                return Err(Error::corrupt("expiry row"));
+            }
+            let at = u64::from_be_bytes(row[..8].try_into().expect("8 bytes"));
+            if at > now_ms {
+                break;
+            }
+            let key = &row[8..];
+            // The row is still the value's own only if the value has not
+            // been overwritten or deleted since.
+            let current = match self.data.get(key).map_err(local)? {
+                Some(stored) => {
+                    let entry = decode_entry(&stored)?;
+                    !entry.tombstone && entry.expires_ms == Some(at)
+                }
+                None => false,
+            };
+            if current {
+                due.push(key.to_vec());
+                if due.len() >= limit {
+                    break;
+                }
+            } else {
+                stale.push(row.to_vec());
+            }
+        }
+        if !stale.is_empty() {
+            let mut batch = self.batch();
+            for row in stale {
+                batch.remove(&self.expiry, row);
+            }
+            batch.commit().map_err(local)?;
+        }
+        Ok(due)
+    }
 }
 
 /// Merges pending buffered writes over replicated data, in key order,
@@ -595,6 +720,9 @@ pub struct Iter {
     overlay: Side,
     data: Side,
     cipher: Option<Arc<Cipher>>,
+    /// Values that expired by this time are skipped: the time the iteration
+    /// started, so one iteration sees one consistent moment.
+    now_ms: u64,
     // Keeps the database open while the iterator lives.
     _open: Arc<dyn std::any::Any + Send + Sync>,
 }
@@ -635,6 +763,7 @@ impl Iter {
             overlay: Side::new(iters.0, 8),
             data: Side::new(iters.1, 0),
             cipher,
+            now_ms: now_ms(),
             _open: open,
         }
     }
@@ -662,13 +791,13 @@ impl Iter {
             if stored.len() < side.skip {
                 return Err(Error::corrupt("overlay entry"));
             }
-            let (tombstone, _, value) = decode_entry(&stored[side.skip..])?;
-            if tombstone {
+            let entry = decode_entry(&stored[side.skip..])?;
+            if !entry.live(self.now_ms) {
                 continue;
             }
             let value = match &self.cipher {
-                Some(cipher) => cipher.open(&key, value)?,
-                None => value.to_vec(),
+                Some(cipher) => cipher.open(&key, entry.value)?,
+                None => entry.value.to_vec(),
             };
             return Ok(Some((key, value)));
         }
@@ -717,6 +846,7 @@ mod tests {
             value: value.as_bytes().to_vec(),
             hlc: hlc(1),
             tombstone: false,
+            expires_ms: None,
         }
     }
 
@@ -759,6 +889,7 @@ mod tests {
                 value: Vec::new(),
                 hlc: hlc(9),
                 tombstone: true,
+                expires_ms: None,
             },
             Record::Watermark {
                 replica: ReplicaId([3; 16]),
@@ -830,6 +961,7 @@ mod tests {
                 key: key.as_bytes().to_vec(),
                 value: value.as_bytes().to_vec(),
                 hlc: hlc(lsn),
+                expires_ms: None,
             }],
         };
         store
@@ -885,6 +1017,7 @@ mod tests {
             key: key.as_bytes().to_vec(),
             value: b"v".to_vec(),
             hlc: hlc(2),
+            expires_ms: None,
         };
         store
             .apply(
