@@ -112,6 +112,16 @@ pub enum Error {
         /// The first key whose condition did not hold.
         key: Vec<u8>,
     },
+    /// A read or write named a key outside the prefixes this partial copy
+    /// holds. For a range or prefix, `key` is where it starts.
+    #[error(
+        "key {:?} is outside the prefixes this copy holds",
+        String::from_utf8_lossy(key)
+    )]
+    NotReplicated {
+        /// The key, or the start of the range, that is not held.
+        key: Vec<u8>,
+    },
 }
 
 impl Error {
@@ -138,6 +148,7 @@ impl Error {
             Error::Service { code, .. } => code,
             Error::Unsupported(_) => "UNSUPPORTED",
             Error::ConditionFailed { .. } => "CONDITION_FAILED",
+            Error::NotReplicated { .. } => "NOT_REPLICATED",
         }
     }
 

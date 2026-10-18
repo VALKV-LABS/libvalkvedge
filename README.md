@@ -22,6 +22,8 @@ conditional writes rather than a lock service.
   resumes believing it is still the owner.
 - **Replicas.** Any number of read-only followers. A new one starts from a snapshot, not
   from the beginning of history.
+- **Partial copies.** `database("…").prefixes(["team/42/"])` keeps only the keys under
+  those prefixes, for data shared by a team where each copy holds what it may see.
 - **Many databases per process.** Thousands on disk, a bounded number open. Idle ones are
   closed and reopen on next use without the caller noticing.
 - **Optional encryption.** Values are sealed with a key you supply before they are

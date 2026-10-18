@@ -2,6 +2,7 @@
 //! buffered writes, and the overlay that makes those writes readable.
 
 use crate::crypto::Cipher;
+use crate::prefixes::Prefixes;
 use fjall::{Keyspace, KeyspaceCreateOptions, PersistMode};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -31,6 +32,7 @@ const RESETTING: &[u8] = b"resetting";
 const REPLICA_ID: &[u8] = b"device";
 const OUTBOX_STAT: &[u8] = b"outbox";
 const ENC_CHECK: &[u8] = b"enc";
+const PREFIXES: &[u8] = b"prefixes";
 
 fn local(e: fjall::Error) -> Error {
     Error::local(e)
@@ -55,6 +57,9 @@ pub(crate) struct LocalStore {
     // Serializes read-modify-write sequences. Fjall itself is thread-safe.
     write: Mutex<()>,
     feed: ChangeFeed,
+    /// For a partial copy, the prefixes it holds. Anything else that arrives
+    /// is dropped.
+    prefixes: Option<Prefixes>,
 }
 
 fn encode_entry(tombstone: bool, hlc: &Hlc, value: &[u8]) -> Vec<u8> {
@@ -82,11 +87,15 @@ fn encode_pos(pos: &ChainPos) -> Vec<u8> {
 }
 
 impl LocalStore {
+    /// Opens the store. With `prefixes`, it is a partial copy holding only
+    /// those; when they differ from what the copy held before, it is marked
+    /// to be downloaded again.
     pub(crate) fn open(
         path: &Path,
         cache_bytes: u64,
         fsync: bool,
         feed: ChangeFeed,
+        prefixes: Option<Prefixes>,
     ) -> Result<Self> {
         std::fs::create_dir_all(path).map_err(Error::local)?;
         let db = fjall::Database::builder(path)
@@ -98,7 +107,7 @@ impl LocalStore {
             db.keyspace(name, KeyspaceCreateOptions::default)
                 .map_err(local)
         };
-        Ok(LocalStore {
+        let store = LocalStore {
             data: ks("data")?,
             meta: ks("meta")?,
             // Named "devices" on disk, from before replicas were called replicas.
@@ -108,8 +117,44 @@ impl LocalStore {
             persist: fsync.then_some(PersistMode::SyncAll),
             write: Mutex::new(()),
             feed,
+            prefixes,
             db,
-        })
+        };
+        store.record_prefixes()?;
+        Ok(store)
+    }
+
+    /// Records which prefixes the copy holds. If that changed, what it has
+    /// is not what it should hold, so it is marked to be downloaded again
+    /// before it is used.
+    fn record_prefixes(&self) -> Result<()> {
+        let stored = match self.meta_get(PREFIXES)? {
+            Some(bytes) => Some(Prefixes::decode(&bytes)?),
+            None => None,
+        };
+        if stored == self.prefixes {
+            return Ok(());
+        }
+        if self.outbox_stat()?.entries > 0 {
+            return Err(Error::Unsupported(
+                "this copy has buffered writes not yet uploaded: open it with its old prefixes and flush before changing them"
+                    .into(),
+            ));
+        }
+        let mut batch = self.batch();
+        match &self.prefixes {
+            Some(prefixes) => batch.insert(&self.meta, PREFIXES, prefixes.encode()),
+            None => batch.remove(&self.meta, PREFIXES),
+        }
+        if self.position()? != ChainPos::default() {
+            batch.insert(&self.meta, RESETTING, [1u8]);
+        }
+        batch.commit().map_err(local)
+    }
+
+    /// True when this copy keeps `key`.
+    fn holds(&self, key: &[u8]) -> bool {
+        self.prefixes.as_ref().is_none_or(|p| p.holds_key(key))
     }
 
     fn batch(&self) -> fjall::OwnedWriteBatch {
@@ -365,7 +410,7 @@ impl LocalStore {
         let watched = self.watched();
         let mut changed = Vec::new();
         for frame in frames.iter().filter(|f| f.lsn > applied) {
-            for op in &frame.ops {
+            for op in frame.ops.iter().filter(|op| self.holds(&op.key)) {
                 let stored = encode_entry(op.kind == OpKind::Delete, &op.hlc, &op.value);
                 batch.insert(&self.data, op.key.as_slice(), stored);
                 // A pending buffered write hides the replicated value, so
@@ -461,6 +506,7 @@ impl StateStore for LocalStore {
         let mut batch = self.batch();
         for record in records {
             match record {
+                Record::Entry { key, .. } if !self.holds(key) => {}
                 Record::Entry {
                     key,
                     value,
@@ -640,13 +686,21 @@ impl Iterator for Iter {
 mod tests {
     use super::*;
     fn store(dir: &tempfile::TempDir) -> LocalStore {
+        partial(dir, None).unwrap()
+    }
+
+    fn partial(dir: &tempfile::TempDir, prefixes: Option<&[&str]>) -> Result<LocalStore> {
         LocalStore::open(
             dir.path(),
             8 * 1024 * 1024,
             false,
             tokio::sync::broadcast::channel(16).0,
+            prefixes.map(|list| {
+                Prefixes::new(list.iter().map(|p| p.as_bytes()))
+                    .unwrap()
+                    .unwrap()
+            }),
         )
-        .unwrap()
     }
 
     fn hlc(ms: u64) -> Hlc {
@@ -808,6 +862,67 @@ mod tests {
         assert_eq!(read(&reopened, "b").as_deref(), Some("newer"));
         assert_eq!(read(&reopened, "c"), None);
         assert_eq!(reopened.position().unwrap(), pos(7));
+    }
+
+    #[test]
+    fn a_partial_copy_keeps_only_its_prefixes_and_is_reloaded_when_they_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = partial(&dir, Some(&["team/"])).unwrap();
+        store.begin_reset().unwrap();
+        store
+            .load(&[
+                entry("other/1", "x"),
+                entry("team/1", "a"),
+                Record::Watermark {
+                    replica: ReplicaId([3; 16]),
+                    seq: 4,
+                },
+            ])
+            .unwrap();
+        store.finish_reset(pos(1)).unwrap();
+        let op = |key: &str| Op {
+            kind: OpKind::Put,
+            key: key.as_bytes().to_vec(),
+            value: b"v".to_vec(),
+            hlc: hlc(2),
+        };
+        store
+            .apply(
+                &[Frame {
+                    lsn: 2,
+                    commit_hlc: hlc(2),
+                    origin: None,
+                    ops: vec![op("other/2"), op("team/2")],
+                }],
+                pos(2),
+            )
+            .unwrap();
+        assert_eq!(read(&store, "team/1").as_deref(), Some("a"));
+        assert_eq!(read(&store, "team/2").as_deref(), Some("v"));
+        assert_eq!(read(&store, "other/1"), None);
+        assert_eq!(read(&store, "other/2"), None);
+        assert_eq!(store.watermark(&ReplicaId([3; 16])).unwrap(), 4);
+        assert_eq!(store.position().unwrap(), pos(2), "every frame counts");
+
+        // Same prefixes again: nothing to do.
+        drop(store);
+        let same = partial(&dir, Some(&["team/"])).unwrap();
+        assert!(!same.needs_bootstrap().unwrap());
+
+        // Other prefixes, or the whole database: downloaded again.
+        drop(same);
+        let wider = partial(&dir, None).unwrap();
+        assert!(wider.needs_bootstrap().unwrap());
+
+        // Not while buffered writes wait to be uploaded under the old ones.
+        wider.begin_reset().unwrap();
+        wider.finish_reset(pos(2)).unwrap();
+        wider.buffer(&[op("team/3")], 1 << 20).unwrap();
+        drop(wider);
+        assert_eq!(
+            partial(&dir, Some(&["team/"])).err().unwrap().code(),
+            "UNSUPPORTED"
+        );
     }
 
     #[test]

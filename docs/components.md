@@ -258,6 +258,16 @@ swapping the manifest to a new generation. Deletes older than the retention wind
 left out. The previous generation is kept for a grace period for replicas that are
 slightly behind, then deleted.
 
+**Partial replicas.** A replica opened with `DatabaseBuilder::prefixes` keeps only the
+keys under those prefixes (at most 16). It reads the same segments and snapshot parts,
+and the local store drops every operation and snapshot entry outside the prefixes as it
+applies them. Frames still advance its LSN, so its position means what it means for any
+replica. The prefixes are recorded in the local store. Opened again with others, the
+copy is marked for a snapshot load and downloaded again; that is refused while the
+outbox holds writes not yet uploaded. Reads, scans, watches and writes that reach
+outside the prefixes fail with `NOT_REPLICATED`, since the copy cannot answer them. A
+writer holds the whole database and cannot be partial.
+
 ## Many databases in one process
 
 Each database is its own Fjall database in its own directory. Databases can be grouped

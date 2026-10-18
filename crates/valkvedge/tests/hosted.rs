@@ -26,7 +26,8 @@ use valkvedge::{
     object_store, Database, Durability, Hlc, LeaseConfig, Op, OpKind, OpOutcome, Options,
     OutboxEntry, RejectReason, ReplicaId, ValkvEdge, Version, WatchEvent, WriteOutcome,
 };
-use valkvedge_log::{read_manifest, read_segments, Layout, Segment, Store};
+use valkvedge_log::format::{decode_snapshot_part, encode_snapshot_part};
+use valkvedge_log::{read_manifest, read_segments, Layout, Record, Segment, Store};
 
 const API_KEY: &str = "ekv_test_key";
 const UP: u8 = 0;
@@ -51,9 +52,35 @@ struct Server {
     hold_log: AtomicBool,
     /// How many `GET /log` requests asked to wait.
     waits_asked: AtomicUsize,
+    /// The prefixes asked for on each read of the log or the snapshot.
+    prefixes_asked: std::sync::Mutex<Vec<Vec<String>>>,
 }
 
 type Shared = State<Arc<Server>>;
+/// Query parameters in order, so that one may appear more than once.
+type Params = Query<Vec<(String, String)>>;
+
+fn param<'a>(query: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    query
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+/// The `prefix` parameters of a read by a partial copy: empty for a whole one.
+fn prefixes(server: &Server, query: &[(String, String)]) -> Vec<String> {
+    let asked: Vec<String> = query
+        .iter()
+        .filter(|(k, _)| k == "prefix")
+        .map(|(_, v)| v.clone())
+        .collect();
+    server.prefixes_asked.lock().unwrap().push(asked.clone());
+    asked
+}
+
+fn kept(prefixes: &[String], key: &[u8]) -> bool {
+    prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_bytes()))
+}
 
 fn error(status: StatusCode, code: &'static str, message: &str) -> Response {
     let mut response = (
@@ -267,14 +294,17 @@ async fn head(State(server): Shared, Path(database): Path<String>, headers: Head
 async fn log(
     State(server): Shared,
     Path(database): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
+    Query(query): Params,
     headers: HeaderMap,
 ) -> Response {
     let db = match server.open(&headers, &database, false).await {
         Ok(db) => db,
         Err(response) => return response,
     };
-    let after: u64 = query.get("after").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let prefixes = prefixes(&server, &query);
+    let after: u64 = param(&query, "after")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     if let Some(replica) = headers
         .get("x-edgekv-replica")
         .and_then(|v| v.to_str().ok())
@@ -286,8 +316,7 @@ async fn log(
             .push((replica.to_string(), after));
     }
     let layout = Layout::new(db.object_prefix().unwrap());
-    let wait = query
-        .get("wait_ms")
+    let wait = param(&query, "wait_ms")
         .and_then(|v| v.parse().ok())
         .map(Duration::from_millis);
     if wait.is_some() {
@@ -315,6 +344,11 @@ async fn log(
                 .filter(|f| f.lsn > after)
                 // Small pages, so the client's paging loop is exercised.
                 .take(3)
+                // A partial copy gets every frame, with only its keys in it.
+                .map(|mut f| {
+                    f.ops.retain(|op| kept(&prefixes, &op.key));
+                    f
+                })
                 .collect();
         }
         // Held: nothing new yet, and time left to wait for it.
@@ -340,12 +374,14 @@ async fn log(
 async fn snapshot(
     State(server): Shared,
     Path(database): Path<String>,
+    Query(query): Params,
     headers: HeaderMap,
 ) -> Response {
     let db = match server.open(&headers, &database, false).await {
         Ok(db) => db,
         Err(response) => return response,
     };
+    let prefixes = prefixes(&server, &query);
     let layout = Layout::new(db.object_prefix().unwrap());
     let Some((manifest, _)) = read_manifest(&server.store, &layout).await.unwrap() else {
         return Json(json!({ "generation": 0, "snapshot_lsn": 0, "parts": [] })).into_response();
@@ -355,12 +391,21 @@ async fn snapshot(
         .iter()
         .enumerate()
         .map(|(i, part)| {
-            json!({
-                "index": i,
-                "size": part.size,
-                "checksum": part.checksum,
-                "url": format!("/v1/db/{database}/snapshot/parts/{i}?generation={}", manifest.generation),
-            })
+            let mut url = reqwest::Url::parse(&format!(
+                "http://x/v1/db/{database}/snapshot/parts/{i}?generation={}",
+                manifest.generation
+            ))
+            .unwrap();
+            for prefix in &prefixes {
+                url.query_pairs_mut().append_pair("prefix", prefix);
+            }
+            let url = &url.as_str()["http://x".len()..];
+            if prefixes.is_empty() {
+                json!({ "index": i, "size": part.size, "checksum": part.checksum, "url": url })
+            } else {
+                // Filtered when downloaded: its checksum is not known yet.
+                json!({ "index": i, "url": url })
+            }
         })
         .collect();
     Json(json!({
@@ -374,24 +419,31 @@ async fn snapshot(
 async fn snapshot_part(
     State(server): Shared,
     Path((database, part)): Path<(String, usize)>,
+    Query(query): Params,
     headers: HeaderMap,
 ) -> Response {
     let db = match server.open(&headers, &database, false).await {
         Ok(db) => db,
         Err(response) => return response,
     };
+    let prefixes = prefixes(&server, &query);
     let layout = Layout::new(db.object_prefix().unwrap());
     let (manifest, _) = read_manifest(&server.store, &layout)
         .await
         .unwrap()
         .unwrap();
-    let object = server
-        .store
-        .get(&manifest.snapshot_parts[part].key)
-        .await
-        .unwrap()
-        .unwrap();
-    object.bytes.into_response()
+    let stored = &manifest.snapshot_parts[part];
+    let object = server.store.get(&stored.key).await.unwrap().unwrap();
+    if prefixes.is_empty() {
+        return object.bytes.into_response();
+    }
+    let mut records = decode_snapshot_part(&object.bytes, stored.checksum).unwrap();
+    records.retain(|record| match record {
+        Record::Entry { key, .. } => kept(&prefixes, key),
+        Record::Watermark { .. } => true,
+    });
+    let (bytes, _) = encode_snapshot_part(part as u32, &records);
+    Bytes::from(bytes).into_response()
 }
 
 async fn kv_get(
@@ -487,6 +539,7 @@ async fn service(dir: &tempfile::TempDir) -> Service {
         presented: std::sync::Mutex::new(Vec::new()),
         hold_log: AtomicBool::new(true),
         waits_asked: AtomicUsize::new(0),
+        prefixes_asked: std::sync::Mutex::new(Vec::new()),
     });
     let app = Router::new()
         .route("/v1/db/{db}/commit", post(commit))
@@ -1462,4 +1515,180 @@ async fn a_followed_database_still_closes_when_nobody_uses_it() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+// --- Partial copies --------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_copy_holds_and_receives_only_its_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(&dir).await;
+    let [adir, bdir, cdir] = dirs();
+    let a = replica(&adir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    a.put(b"team/1", b"ours").await.unwrap();
+    a.put(b"other/1", b"theirs").await.unwrap();
+
+    let b = replica(&bdir, &service, API_KEY)
+        .database("app")
+        .prefixes(["team/"])
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(text(b.get(b"team/1").unwrap()).as_deref(), Some("ours"));
+    assert_eq!(refused(b.get(b"other/1")), "NOT_REPLICATED");
+    assert_eq!(refused(b.prefix(b"").map(|_| ())), "NOT_REPLICATED");
+    assert_eq!(
+        refused(b.range(b"team/".to_vec()..).map(|_| ())),
+        "NOT_REPLICATED"
+    );
+    assert_eq!(refused(b.watch(b"oth").map(|_| ())), "NOT_REPLICATED");
+    assert_eq!(
+        b.range(b"team/0".to_vec()..b"team/9".to_vec())
+            .unwrap()
+            .count(),
+        1
+    );
+    // The service is still there for keys the copy does not hold.
+    assert_eq!(
+        text(b.fetch(b"other/1").await.unwrap()).as_deref(),
+        Some("theirs")
+    );
+
+    // Writes: only its own keys.
+    assert_eq!(refused(b.put(b"other/2", b"x").await), "NOT_REPLICATED");
+    let mut mixed = b.batch();
+    mixed.put(b"team/2", b"x").put(b"other/2", b"x");
+    assert_eq!(refused(mixed.commit().await), "NOT_REPLICATED");
+    b.put(b"team/2", b"from-b").await.unwrap();
+
+    // Followed: new writes under its prefix arrive, others do not.
+    a.put(b"team/3", b"new").await.unwrap();
+    a.put(b"other/3", b"new").await.unwrap();
+    let lsn = b.sync().await.unwrap();
+    assert_eq!(lsn, a.sync().await.unwrap(), "every frame counts");
+    assert_eq!(b.prefix(b"team/").unwrap().count(), 3);
+    assert!(
+        server_asked(&service, &["team/"]),
+        "the copy asked for its prefixes"
+    );
+
+    // A new partial copy after compaction is loaded from a filtered snapshot.
+    service
+        .server
+        .kv
+        .database("app")
+        .open()
+        .await
+        .unwrap()
+        .compact()
+        .await
+        .unwrap();
+    let c = replica(&cdir, &service, API_KEY)
+        .database("app")
+        .prefixes(["other/"])
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(c.prefix(b"other/").unwrap().count(), 2);
+    assert_eq!(refused(c.get(b"team/1")), "NOT_REPLICATED");
+    assert_eq!(c.status().unwrap().applied_lsn, lsn);
+}
+
+fn refused<T>(result: valkvedge::Result<T>) -> &'static str {
+    result.err().expect("refused").code()
+}
+
+fn server_asked(service: &Service, prefixes: &[&str]) -> bool {
+    let want: Vec<String> = prefixes.iter().map(|p| p.to_string()).collect();
+    service
+        .server
+        .prefixes_asked
+        .lock()
+        .unwrap()
+        .contains(&want)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_opened_with_other_prefixes_is_downloaded_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(&dir).await;
+    let [adir, bdir, cdir] = dirs();
+    let a = replica(&adir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    a.put(b"team/1", b"t").await.unwrap();
+    a.put(b"other/1", b"o").await.unwrap();
+
+    {
+        let b = replica(&bdir, &service, API_KEY)
+            .database("app")
+            .prefixes(["team/"])
+            .open()
+            .await
+            .unwrap();
+        assert_eq!(text(b.get(b"team/1").unwrap()).as_deref(), Some("t"));
+    }
+    // Same directory, another process: the whole database.
+    let whole = replica(&bdir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(text(whole.get(b"other/1").unwrap()).as_deref(), Some("o"));
+    assert_eq!(text(whole.get(b"team/1").unwrap()).as_deref(), Some("t"));
+
+    // In one process, a database is opened one way.
+    let again = replica(&cdir, &service, API_KEY);
+    again.database("app").open().await.unwrap();
+    let err = again
+        .database("app")
+        .prefixes(["team/"])
+        .open()
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "UNSUPPORTED");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prefixes_are_refused_where_a_partial_copy_makes_no_sense() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(&dir).await;
+    let [a, b, c] = dirs();
+    let code = |r: valkvedge::Result<Database>| r.err().unwrap().code();
+
+    let ingesting = replica(&a, &service, API_KEY)
+        .database("app")
+        .ingest()
+        .prefixes(["team/"])
+        .open()
+        .await;
+    assert_eq!(code(ingesting), "UNSUPPORTED");
+
+    let binary = replica(&b, &service, API_KEY)
+        .database("app")
+        .prefixes([&[0xff, 0xfe][..]])
+        .open()
+        .await;
+    assert_eq!(code(binary), "UNSUPPORTED", "hosted prefixes are text");
+
+    let local = ValkvEdge::builder(c.path())
+        .options(fast())
+        .build()
+        .unwrap()
+        .database("app")
+        .prefixes(["team/"])
+        .open()
+        .await;
+    assert_eq!(
+        code(local),
+        "UNSUPPORTED",
+        "nothing to be a partial copy of"
+    );
 }

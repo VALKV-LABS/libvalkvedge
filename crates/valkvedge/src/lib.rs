@@ -59,11 +59,13 @@
 
 mod crypto;
 mod local;
+mod prefixes;
 mod remote;
 mod watch;
 
 use crypto::Cipher;
 use local::{ChangeFeed, LocalStore};
+use prefixes::Prefixes;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::ops::{Bound, RangeBounds};
@@ -76,6 +78,7 @@ use valkvedge_log::{Frame, HlcClock, Layout, Node, Store};
 use valkvedge_sync::{Change, CommitCounters, Condition, StateStore, Writer};
 
 pub use local::Iter;
+pub use prefixes::MAX_PREFIXES;
 pub use valkvedge_log::{Error as ValkvEdgeError, LeaseConfig, Lsn, OpKind, RejectReason, Result};
 pub use valkvedge_log::{Hlc, Op, ReplicaId};
 pub use valkvedge_sync::{OpOutcome, OutboxEntry, PushReport, WriterConfig};
@@ -391,6 +394,9 @@ struct Shared {
     feed: ChangeFeed,
     /// A task is keeping this hosted database's local copy current.
     following: AtomicBool,
+    /// Set by the first open: for a partial copy, the prefixes it holds
+    /// ([`DatabaseBuilder::prefixes`]).
+    prefixes: OnceLock<Option<Prefixes>>,
 }
 
 struct Open {
@@ -495,6 +501,7 @@ impl Inner {
                 self.options.cache_bytes_per_database,
                 self.options.local_fsync,
                 shared.feed.clone(),
+                shared.prefixes(),
             ) {
                 Ok(store) => return Ok(store),
                 Err(e) if Instant::now() >= deadline => return Err(e),
@@ -657,6 +664,11 @@ impl Shared {
         self.ingest.get().copied().unwrap_or(false)
     }
 
+    /// For a partial copy, the prefixes it holds.
+    fn prefixes(&self) -> Option<Prefixes> {
+        self.prefixes.get().cloned().flatten()
+    }
+
     /// The open database, without opening it.
     fn current(&self) -> Option<Arc<Open>> {
         self.slot.lock().expect("slot lock").clone()
@@ -702,6 +714,7 @@ impl ValkvEdge {
             durability: Durability::default(),
             key: None,
             ingest: false,
+            prefixes: None,
         }
     }
 
@@ -797,6 +810,7 @@ impl Namespace {
             durability: Durability::default(),
             key: None,
             ingest: false,
+            prefixes: None,
         }
     }
 }
@@ -808,9 +822,30 @@ pub struct DatabaseBuilder {
     durability: Durability,
     key: Option<[u8; 32]>,
     ingest: bool,
+    prefixes: Option<Vec<Vec<u8>>>,
 }
 
 impl DatabaseBuilder {
+    /// Keeps a partial copy: only keys starting with one of `prefixes` are
+    /// downloaded, stored and followed. Reads and writes of any other key,
+    /// and scans and watches that reach past the prefixes, fail with
+    /// `NOT_REPLICATED`; [`Database::fetch`] still reads any key from a
+    /// hosted service.
+    ///
+    /// For data shared by a team, where each copy should hold only what it
+    /// is allowed to see. A hosted service sends only those keys, and a
+    /// token can be limited to them; as a replica of an object store, the
+    /// copy reads the whole log and keeps only those keys. A writer, or a
+    /// database with no remote copy, cannot be partial. With a hosted
+    /// service the prefixes must be UTF-8 text.
+    ///
+    /// At most [`MAX_PREFIXES`]. An empty prefix means every key. Opening
+    /// a copy again with other prefixes downloads it again.
+    pub fn prefixes<P: AsRef<[u8]>>(mut self, prefixes: impl IntoIterator<Item = P>) -> Self {
+        self.prefixes = Some(prefixes.into_iter().map(|p| p.as_ref().to_vec()).collect());
+        self
+    }
+
     /// Opens the database for ingestion: writes are buffered on local disk,
     /// uploaded in the background, and removed once the service has them;
     /// nothing is downloaded and no local copy is kept. Reads go to the
@@ -872,6 +907,7 @@ impl DatabaseBuilder {
                     events: Mutex::new(VecDeque::new()),
                     feed: tokio::sync::broadcast::channel(WATCH_BUFFER).0,
                     following: AtomicBool::new(false),
+                    prefixes: OnceLock::new(),
                 })
             })
             .clone();
@@ -896,6 +932,39 @@ impl DatabaseBuilder {
         if *shared.ingest.get_or_init(|| self.ingest) != self.ingest {
             return Err(ValkvEdgeError::Unsupported(
                 "this database is already open in this process for ingestion, or not for ingestion; open it the same way"
+                    .into(),
+            ));
+        }
+        let prefixes = match self.prefixes {
+            Some(list) => Prefixes::new(list)?,
+            None => None,
+        };
+        if let Some(prefixes) = &prefixes {
+            if self.ingest {
+                return Err(ValkvEdgeError::Unsupported(
+                    "a database opened for ingestion keeps no copy, partial or whole".into(),
+                ));
+            }
+            if self.kv.role() != Some(Role::Replica) && !self.kv.is_remote() {
+                return Err(ValkvEdgeError::Unsupported(
+                    "a partial copy follows a database kept elsewhere: use a hosted service or the replica role"
+                        .into(),
+                ));
+            }
+            if self.kv.is_remote()
+                && prefixes
+                    .as_slice()
+                    .iter()
+                    .any(|p| std::str::from_utf8(p).is_err())
+            {
+                return Err(ValkvEdgeError::Unsupported(
+                    "with a hosted service, prefixes must be UTF-8 text".into(),
+                ));
+            }
+        }
+        if *shared.prefixes.get_or_init(|| prefixes.clone()) != prefixes {
+            return Err(ValkvEdgeError::Unsupported(
+                "this database is already open in this process with other prefixes; open it the same way"
                     .into(),
             ));
         }
@@ -1117,9 +1186,32 @@ impl Database {
         Ok(())
     }
 
+    /// Refuses a key a partial copy does not hold.
+    fn held(&self, key: &[u8]) -> Result<()> {
+        match self.shared.prefixes.get().and_then(Option::as_ref) {
+            Some(prefixes) if !prefixes.holds_key(key) => {
+                Err(ValkvEdgeError::NotReplicated { key: key.to_vec() })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Refuses a scan or watch of a prefix a partial copy does not hold whole.
+    fn held_prefix(&self, prefix: &[u8]) -> Result<()> {
+        match self.shared.prefixes.get().and_then(Option::as_ref) {
+            Some(prefixes) if !prefixes.holds_prefix(prefix) => {
+                Err(ValkvEdgeError::NotReplicated {
+                    key: prefix.to_vec(),
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Reads a key from the local store. Never touches the network.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.local_reads()?;
+        self.held(key)?;
         let open = self.open()?;
         match (open.store.get_stored(key)?, self.cipher()) {
             (None, _) => Ok(None),
@@ -1137,6 +1229,7 @@ impl Database {
     /// version then fails and the copy is brought up to date.
     pub fn get_versioned(&self, key: &[u8]) -> Result<Option<(Vec<u8>, Version)>> {
         self.local_reads()?;
+        self.held(key)?;
         let open = self.open()?;
         match open.store.get_stored_versioned(key)? {
             None => Ok(None),
@@ -1159,6 +1252,7 @@ impl Database {
     /// or object store in the background, until the [`Watch`] is dropped.
     pub fn watch(&self, prefix: &[u8]) -> Result<Watch> {
         self.local_reads()?;
+        self.held_prefix(prefix)?;
         let open = self.open()?;
         Ok(Watch::new(
             self.clone(),
@@ -1231,6 +1325,17 @@ impl Database {
             Bound::Unbounded => Bound::Unbounded,
         };
         self.local_reads()?;
+        if let Some(prefixes) = self.shared.prefixes.get().and_then(Option::as_ref) {
+            let start = range.start_bound().map(K::as_ref);
+            let end = range.end_bound().map(K::as_ref);
+            if !prefixes.holds_range(start, end) {
+                let start = match range.start_bound() {
+                    Bound::Included(k) | Bound::Excluded(k) => k.as_ref().to_vec(),
+                    Bound::Unbounded => Vec::new(),
+                };
+                return Err(ValkvEdgeError::NotReplicated { key: start });
+            }
+        }
         let open = self.open()?;
         let iters = open
             .store
@@ -1241,6 +1346,7 @@ impl Database {
     /// Iterates keys starting with `prefix`, in order, from the local store.
     pub fn prefix(&self, prefix: &[u8]) -> Result<Iter> {
         self.local_reads()?;
+        self.held_prefix(prefix)?;
         let open = self.open()?;
         let iters = open.store.scan_prefix(prefix);
         Ok(Iter::new(iters, self.cipher().cloned(), open))
@@ -1379,6 +1485,7 @@ impl Database {
                         &self.shared.name,
                         open.clock.replica(),
                         self.kv.options.sync_write_timeout,
+                        self.shared.prefixes(),
                     )?;
                     return Ok(Session::Remote(Box::new(client)));
                 }
@@ -1544,6 +1651,9 @@ impl Database {
                     limit: MAX_KEY_BYTES,
                 });
             }
+            // A partial copy would never see what became of a write it did
+            // not hold.
+            self.held(key)?;
         }
         for change in &changes {
             if change.value.len() > MAX_VALUE_BYTES {

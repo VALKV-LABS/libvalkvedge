@@ -755,3 +755,57 @@ async fn encrypted_values_never_reach_the_object_store_in_clear() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_partial_replica_keeps_only_its_prefixes_through_frames_and_snapshots() {
+    let store = Arc::new(InMemory::new());
+    let [wdir, rdir, ldir] = [(); 3].map(|_| tempfile::tempdir().unwrap());
+    let writer = client(&wdir, &store, Role::Writer);
+    let db = writer.database("app").open().await.unwrap();
+    db.put(b"team/1", b"a").await.unwrap();
+    db.put(b"other/1", b"b").await.unwrap();
+
+    let replica = client(&rdir, &store, Role::Replica);
+    let partial = replica
+        .database("app")
+        .prefixes(["team/"])
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(text(partial.get(b"team/1").unwrap()).as_deref(), Some("a"));
+    assert_eq!(
+        partial.get(b"other/1").unwrap_err().code(),
+        "NOT_REPLICATED"
+    );
+
+    db.put(b"team/2", b"c").await.unwrap();
+    db.put(b"other/2", b"d").await.unwrap();
+    assert_eq!(partial.sync().await.unwrap(), 4);
+    let keys: Vec<Vec<u8>> = partial
+        .prefix(b"team/")
+        .unwrap()
+        .map(|e| e.unwrap().0)
+        .collect();
+    assert_eq!(keys, vec![b"team/1".to_vec(), b"team/2".to_vec()]);
+
+    // Loaded from a snapshot, the same.
+    db.compact().await.unwrap();
+    let late = client(&ldir, &store, Role::Replica)
+        .database("app")
+        .prefixes(["other/"])
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(late.prefix(b"other/").unwrap().count(), 2);
+    assert_eq!(late.get(b"team/1").unwrap_err().code(), "NOT_REPLICATED");
+
+    // The writer holds everything: it cannot be partial.
+    let err = client(&tempfile::tempdir().unwrap(), &store, Role::Writer)
+        .database("app")
+        .prefixes(["team/"])
+        .open()
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "UNSUPPORTED");
+}
