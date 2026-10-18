@@ -14,6 +14,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Its throttling wrapper makes writes slow enough for sync commits to queue.
+object_store.workspace = true
 
 [lints]
 workspace = true

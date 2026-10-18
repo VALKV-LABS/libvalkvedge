@@ -72,8 +72,8 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use valkvedge_log::{HlcClock, Layout, Node, Store};
-use valkvedge_sync::{Change, Condition, StateStore, Writer};
+use valkvedge_log::{Frame, HlcClock, Layout, Node, Store};
+use valkvedge_sync::{Change, CommitCounters, Condition, StateStore, Writer};
 
 pub use local::Iter;
 pub use valkvedge_log::{Error as ValkvEdgeError, LeaseConfig, Lsn, OpKind, RejectReason, Result};
@@ -133,8 +133,15 @@ pub struct Options {
     pub push_interval: Duration,
     /// The outbox is pushed once it holds this many bytes.
     pub push_bytes: u64,
-    /// How often a replica pulls.
+    /// How often a replica pulls. A hosted replica asks to be told of changes
+    /// instead (`follow_wait`), and polls this often only when the service
+    /// does not hold its requests.
     pub pull_interval: Duration,
+    /// How long a hosted service may hold a replica's request for changes
+    /// that have not happened yet. It answers as soon as there are some, so
+    /// changes reach the replica at once rather than at its next poll. Zero
+    /// turns this off: the replica polls every `pull_interval`.
+    pub follow_wait: Duration,
     /// When another live node owns a database, watch it for one lease TTL and
     /// take over if it is dead, instead of failing immediately.
     pub wait_for_lease: bool,
@@ -171,6 +178,7 @@ impl Default for Options {
             push_interval: Duration::from_secs(5),
             push_bytes: 5 * 1024 * 1024,
             pull_interval: Duration::from_secs(1),
+            follow_wait: Duration::from_secs(25),
             wait_for_lease: true,
             lease: LeaseConfig::default(),
             writer: WriterConfig::default(),
@@ -322,6 +330,7 @@ impl Builder {
             open_lock: Mutex::new(()),
             open_count: AtomicUsize::new(0),
             evictions: AtomicU64::new(0),
+            commits: Arc::default(),
             started: Instant::now(),
             node: tokio::sync::OnceCell::new(),
         });
@@ -360,6 +369,8 @@ struct Inner {
     open_lock: Mutex<()>,
     open_count: AtomicUsize,
     evictions: AtomicU64,
+    /// Sync commits written by this process's writers, and in how many segments.
+    commits: Arc<CommitCounters>,
     started: Instant,
     node: tokio::sync::OnceCell<Node>,
 }
@@ -378,6 +389,8 @@ struct Shared {
     events: Mutex<VecDeque<WriteEvent>>,
     /// Changes to the local copy, for [`Database::watch`].
     feed: ChangeFeed,
+    /// A task is keeping this hosted database's local copy current.
+    following: AtomicBool,
 }
 
 struct Open {
@@ -556,11 +569,17 @@ impl Inner {
                     db.flush().await.map(|_| ())
                 }
                 Some(Role::Replica) if shared.is_open() => db.sync().await.map(|_| ()),
-                // Hosted: push what is pending, and keep open copies fresh.
-                None if self.is_remote()
-                    && (shared.is_open() || shared.has_outbox.load(Ordering::Relaxed)) =>
-                {
-                    db.sync().await.map(|_| ())
+                // Hosted: push what is pending. A follower keeps each open
+                // copy current, told of changes as they happen.
+                None if self.is_remote() => {
+                    if shared.is_open() && !shared.ingest() {
+                        self.follow(&shared);
+                    }
+                    if shared.has_outbox.load(Ordering::Relaxed) {
+                        db.flush().await.map(|_| ())
+                    } else {
+                        Ok(())
+                    }
                 }
                 _ => Ok(()),
             };
@@ -578,9 +597,69 @@ impl Inner {
     }
 }
 
+impl Inner {
+    /// Starts the task that keeps a hosted database's local copy current,
+    /// unless one is running. It ends when the database closes.
+    fn follow(self: &Arc<Self>, shared: &Arc<Shared>) {
+        if shared.following.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (weak, shared) = (Arc::downgrade(self), shared.clone());
+        tokio::spawn(async move {
+            let mut failures = 0u32;
+            loop {
+                let Some(kv) = weak.upgrade() else { break };
+                let pull_interval = kv.options.pull_interval;
+                let db = Database {
+                    kv,
+                    shared: shared.clone(),
+                    durability: Durability::Sync,
+                    touch: false,
+                };
+                let step = db.follow_step().await;
+                drop(db);
+                match step {
+                    Ok(Follow::Closed) => break,
+                    Ok(Follow::Changed | Follow::Waited) => failures = 0,
+                    Ok(Follow::Polled) => {
+                        failures = 0;
+                        tokio::time::sleep(pull_interval).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(database = %shared.name, error = %e, "could not follow the database");
+                        failures = failures.saturating_add(1);
+                        let backoff = pull_interval
+                            .saturating_mul(1 << failures.min(5))
+                            .min(Duration::from_secs(30));
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+            }
+            shared.following.store(false, Ordering::SeqCst);
+        });
+    }
+}
+
+/// What one step of following a hosted database did.
+enum Follow {
+    /// The database is closed: stop.
+    Closed,
+    /// The local copy moved forward.
+    Changed,
+    /// The service held the request and nothing changed: ask again at once.
+    Waited,
+    /// The service answered at once with nothing new: poll again later.
+    Polled,
+}
+
 impl Shared {
     fn ingest(&self) -> bool {
         self.ingest.get().copied().unwrap_or(false)
+    }
+
+    /// The open database, without opening it.
+    fn current(&self) -> Option<Arc<Open>> {
+        self.slot.lock().expect("slot lock").clone()
     }
 
     fn is_open(&self) -> bool {
@@ -648,6 +727,13 @@ impl ValkvEdge {
     /// Number of times a database was closed to make room or for being idle.
     pub fn evictions(&self) -> u64 {
         self.inner.evictions.load(Ordering::Relaxed)
+    }
+
+    /// Sync commits this process has written as a writer, and the number of
+    /// log segments they took. Commits made at the same time share a segment,
+    /// so the second number grows more slowly under load.
+    pub fn commits_and_segments(&self) -> (u64, u64) {
+        (self.inner.commits.commits(), self.inner.commits.segments())
     }
 
     /// Releases every lease this process holds and closes every database that
@@ -785,6 +871,7 @@ impl DatabaseBuilder {
                     flush_lock: tokio::sync::Mutex::new(()),
                     events: Mutex::new(VecDeque::new()),
                     feed: tokio::sync::broadcast::channel(WATCH_BUFFER).0,
+                    following: AtomicBool::new(false),
                 })
             })
             .clone();
@@ -837,6 +924,11 @@ impl DatabaseBuilder {
                 if db.kv.is_remote() && cold && !db.shared.ingest() {
                     drop(open);
                     db.sync().await?;
+                }
+                // From now on, changes made elsewhere are applied as they
+                // happen, not at the next tick.
+                if db.kv.is_remote() && !db.shared.ingest() && db.kv.options.background {
+                    db.kv.follow(&db.shared);
                 }
             }
             Some(Role::Replica) => {
@@ -1313,7 +1405,8 @@ impl Database {
                             self.kv.options.writer.clone(),
                             wait_for_lease,
                         )
-                        .await?;
+                        .await?
+                        .with_counters(self.kv.commits.clone());
                         let empty = writer.position().await?.applied_lsn == 0;
                         let stored = writer.encryption_check().await?;
                         if let Some(check) = crypto::reconcile(cipher, stored.as_deref(), empty)? {
@@ -1681,6 +1774,62 @@ impl Database {
             }
         }
         Ok(open.store.position()?.applied_lsn)
+    }
+
+    /// One step of following a hosted database: asks for what follows the
+    /// local copy, waiting up to `follow_wait` for it, and applies it.
+    async fn follow_step(&self) -> Result<Follow> {
+        let Some(open) = self.shared.current() else {
+            return Ok(Follow::Closed);
+        };
+        let session = self.session_within_limit(&open).await?;
+        let Session::Remote(client) = session.as_ref() else {
+            return Ok(Follow::Closed);
+        };
+        let wait = self.kv.options.follow_wait;
+        let applied = open.store.position()?.applied_lsn;
+        if wait.is_zero() || open.store.needs_bootstrap()? {
+            let reached = client.pull(open.store.as_ref()).await?;
+            return Ok(if reached > applied {
+                Follow::Changed
+            } else {
+                Follow::Polled
+            });
+        }
+        // While waiting, only the session is held: a database nobody uses
+        // still closes when it has been idle long enough.
+        drop(open);
+        let asked = Instant::now();
+        let page = client.log(applied, Some(wait)).await?;
+        let Some(open) = self.shared.current() else {
+            return Ok(Follow::Closed);
+        };
+        match page {
+            remote::LogPage::SnapshotRequired => {
+                client.pull(open.store.as_ref()).await?;
+                Ok(Follow::Changed)
+            }
+            remote::LogPage::Frames { frames, waited, .. } if frames.is_empty() => {
+                // A service that says it waited but answered at once would
+                // otherwise be asked again and again without pause.
+                let held = asked.elapsed() >= Duration::from_millis(500);
+                Ok(if waited && held {
+                    Follow::Waited
+                } else {
+                    Follow::Polled
+                })
+            }
+            remote::LogPage::Frames {
+                generation, frames, ..
+            } => {
+                // A write through this replica may have pulled some of these
+                // in the meantime.
+                let now = open.store.position()?.applied_lsn;
+                let fresh: Vec<Frame> = frames.into_iter().filter(|f| f.lsn > now).collect();
+                remote::apply_frames(&open.store, now, generation, &fresh)?;
+                Ok(Follow::Changed)
+            }
+        }
     }
 
     /// The newest LSN in the object store, without applying anything.

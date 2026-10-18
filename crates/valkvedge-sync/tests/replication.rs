@@ -480,3 +480,124 @@ async fn compaction_drops_expired_tombstones_only() {
     assert!(replica.version_of(b"fresh").unwrap().is_some());
     assert_eq!(get(&replica, "keep").as_deref(), Some("v"));
 }
+
+// --- Group commit ---------------------------------------------------------
+
+/// A store whose every write takes 50 ms, as an object store's would, so
+/// commits made meanwhile queue up behind it.
+fn slow_store() -> Store {
+    use object_store::memory::InMemory;
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    let config = ThrottleConfig {
+        wait_put_per_call: Duration::from_millis(50),
+        ..ThrottleConfig::default()
+    };
+    Store::new(Arc::new(ThrottledStore::new(InMemory::new(), config)))
+}
+
+#[tokio::test]
+async fn commits_made_together_share_segments_and_keep_their_own_lsns() {
+    let store = slow_store();
+    let w = Arc::new(writer_on(&store, "a", Arc::new(MemState::new()), false).await);
+
+    // One at a time, each commit is its own segment: nothing waits to group.
+    w.commit(vec![put("first", "1")]).await.unwrap();
+    w.commit(vec![put("second", "2")]).await.unwrap();
+    assert_eq!((w.counters().commits(), w.counters().segments()), (2, 2));
+
+    let tasks: Vec<_> = (0..20)
+        .map(|i| {
+            let w = w.clone();
+            tokio::spawn(async move { w.commit(vec![put(&format!("k{i:02}"), "v")]).await })
+        })
+        .collect();
+    let mut lsns = Vec::new();
+    for task in tasks {
+        lsns.push(task.await.unwrap().unwrap());
+    }
+    lsns.sort_unstable();
+    assert_eq!(
+        lsns,
+        (3..=22).collect::<Vec<_>>(),
+        "each commit has its own LSN"
+    );
+    let (commits, segments) = (w.counters().commits(), w.counters().segments());
+    assert_eq!(commits, 22);
+    assert!(
+        segments - 2 <= 5,
+        "20 commits made together took {} segments",
+        segments - 2
+    );
+
+    // A replica sees every commit, frame by frame.
+    let replica = MemState::new();
+    let pulled = pull(&store, &Layout::new("db"), &replica).await.unwrap();
+    assert_eq!(pulled.applied_lsn, 22);
+    for i in 0..20 {
+        assert_eq!(get(&replica, &format!("k{i:02}")).as_deref(), Some("v"));
+    }
+}
+
+#[tokio::test]
+async fn conditions_in_a_group_see_the_commits_before_them() {
+    use valkvedge_sync::Condition;
+    let store = slow_store();
+    let state = Arc::new(MemState::new());
+    let w = Arc::new(writer_on(&store, "a", state.clone(), false).await);
+    w.commit(vec![put("counter", "0")]).await.unwrap();
+    let version = state.live_version(b"counter").unwrap();
+
+    // Ten writers all read `expected` and try to replace it. A slow commit
+    // is in flight first, so all ten queue behind it and are written as one
+    // group: only checking each against the ones before it in the group
+    // stops a second one from winning.
+    let race = |key: &'static str, expected: Option<Hlc>| {
+        let w = w.clone();
+        async move {
+            let before = (w.counters().commits(), w.counters().segments());
+            let busy = {
+                let w = w.clone();
+                tokio::spawn(async move { w.commit(vec![put("busy", "1")]).await })
+            };
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let racers: Vec<_> = (0..10)
+                .map(|i| {
+                    let w = w.clone();
+                    tokio::spawn(async move {
+                        let condition = Condition {
+                            key: key.as_bytes().to_vec(),
+                            version: expected,
+                        };
+                        w.commit_if(vec![put(key, &i.to_string())], &[condition])
+                            .await
+                    })
+                })
+                .collect();
+            busy.await.unwrap().unwrap();
+            let mut won = 0;
+            for racer in racers {
+                match racer.await.unwrap() {
+                    Ok(_) => won += 1,
+                    Err(e) => assert_eq!(e.code(), "CONDITION_FAILED"),
+                }
+            }
+            let after = (w.counters().commits(), w.counters().segments());
+            assert_eq!(
+                (after.0 - before.0, after.1 - before.1),
+                (2, 2),
+                "the slow commit, then the racers in one segment"
+            );
+            won
+        }
+    };
+    assert_eq!(race("counter", version).await, 1, "one replacement wins");
+    assert_eq!(race("new-key", None).await, 1, "one create wins");
+}
+
+#[tokio::test]
+async fn a_released_writer_fails_every_waiting_commit() {
+    let w = writer_on(&Store::memory(), "a", Arc::new(MemState::new()), false).await;
+    w.release().await.unwrap();
+    let err = w.commit(vec![put("k", "v")]).await.unwrap_err();
+    assert_eq!(err.code(), "FENCED");
+}
