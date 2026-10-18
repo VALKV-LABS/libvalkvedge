@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use valkvedge::{object_store, Durability, LeaseConfig, Options, Role, ValkvEdge};
 
-/// Long enough to read a value before it expires, short enough to wait out.
-const SHORT: Duration = Duration::from_millis(1500);
+/// Short enough to wait out. Nothing is read before it ends.
+const SHORT: Duration = Duration::from_millis(300);
 
 fn options(background: bool) -> Options {
     Options {
@@ -46,15 +46,16 @@ async fn an_expired_value_reads_as_absent_everywhere_and_the_writer_deletes_it()
     let (wdir, rdir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let writer = client(&wdir, &store, Role::Writer);
     let db = writer.database("app").open().await.unwrap();
+    let hour = Duration::from_secs(3600);
     let before = SystemTime::now();
-    db.put_with_ttl(b"session", b"abc", SHORT).await.unwrap(); // 1
+    db.put_with_ttl(b"session", b"abc", hour).await.unwrap(); // 1
     db.put(b"keep", b"1").await.unwrap(); // 2
-    db.put_with_ttl(b"later", b"x", Duration::from_secs(3600))
-        .await
-        .unwrap(); // 3
 
     let at = db.expires_at(b"session").unwrap().expect("expires");
-    assert!(at > before && at <= SystemTime::now() + SHORT, "{at:?}");
+    assert!(
+        at >= before + hour && at <= SystemTime::now() + hour,
+        "{at:?}"
+    );
     assert_eq!(db.expires_at(b"keep").unwrap(), None);
     let replica = client(&rdir, &store, Role::Replica);
     let follower = replica.database("app").open().await.unwrap();
@@ -64,20 +65,27 @@ async fn an_expired_value_reads_as_absent_everywhere_and_the_writer_deletes_it()
     );
     assert_eq!(follower.expires_at(b"session").unwrap(), Some(at));
 
-    wait_out(SHORT).await;
-    // Hidden at once, on the writer and on the replica, before any delete.
-    assert_eq!(db.get(b"session").unwrap(), None);
-    assert_eq!(db.expires_at(b"session").unwrap(), None);
-    assert_eq!(follower.get(b"session").unwrap(), None);
+    // A value whose time has passed reads as absent, on the writer and on
+    // the replica, before any delete.
+    let mut late = db.batch();
+    late.put_expiring(b"gone", b"x", SystemTime::now() - Duration::from_secs(1));
+    late.commit().await.unwrap(); // 3
+    assert_eq!(db.get(b"gone").unwrap(), None);
+    assert_eq!(db.expires_at(b"gone").unwrap(), None);
+    assert_eq!(follower.sync().await.unwrap(), 3);
+    assert_eq!(follower.get(b"gone").unwrap(), None);
     let keys: Vec<Vec<u8>> = db.prefix(b"").unwrap().map(|r| r.unwrap().0).collect();
-    assert_eq!(keys, vec![b"keep".to_vec(), b"later".to_vec()]);
+    assert_eq!(keys, vec![b"keep".to_vec(), b"session".to_vec()]);
 
     // Then deleted, with a delete in the log that replicas apply.
     assert_eq!(db.expire().await.unwrap(), 1);
     assert_eq!(db.status().unwrap().applied_lsn, 4);
     assert_eq!(db.expire().await.unwrap(), 0, "nothing left to delete");
     assert_eq!(follower.sync().await.unwrap(), 4);
-    assert_eq!(text(follower.get(b"later").unwrap()).as_deref(), Some("x"));
+    assert_eq!(
+        text(follower.get(b"session").unwrap()).as_deref(),
+        Some("abc")
+    );
 }
 
 #[tokio::test]
