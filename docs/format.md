@@ -110,15 +110,25 @@ Records:
   "snapshot_lsn": 1042,
   "snapshot_parts": [{ "key": "…/gen/0000000003/snapshot/000000", "size": 8388123, "checksum": 2890133742 }],
   "owner_epoch": 7,
-  "superseded": [{ "generation": 2, "at_ms": 1791700000000 }],
-  "encryption_check": "…hex…"
+  "superseded": [{ "generation": 2, "at_ms": 1791700000000, "snapshot_lsn": 900,
+                   "snapshot_ms": 1791600000000, "snapshot_parts": [] }],
+  "encryption_check": "…hex…",
+  "snapshot_ms": 1791700000000
 }
 ```
 
 Replaced only by compare-and-swap on its entity tag. `generation` is current;
-`snapshot_lsn` 0 with no parts means the generation starts empty. `superseded` lists
-older generations not yet deleted. `encryption_check` is present when values are
-encrypted.
+`snapshot_lsn` 0 with no parts means the generation starts empty. `encryption_check` is
+present when values are encrypted.
+
+`superseded` lists older generations not yet deleted. Each records when it was
+replaced (`at_ms`) and, for the history (see [components](components.md#history)), the
+LSN and time of its snapshot and, while that snapshot is kept, its parts. `restored:
+true`, here or at the top level, marks a snapshot installed by a restore or a branch,
+one LSN past the tail of the log before it: no log leads to it. `snapshot_ms` is when
+the current snapshot was installed. All of these fields are optional: manifests
+without them read as before, and generations without `snapshot_lsn` are not part of
+the history.
 
 ## `lease.json`
 

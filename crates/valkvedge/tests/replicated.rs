@@ -809,3 +809,170 @@ async fn a_partial_replica_keeps_only_its_prefixes_through_frames_and_snapshots(
         .unwrap();
     assert_eq!(err.code(), "UNSUPPORTED");
 }
+
+#[tokio::test]
+async fn a_writer_restores_a_past_state_and_its_replicas_reload_it() {
+    let store = Arc::new(InMemory::new());
+    let [wdir, rdir] = [(); 2].map(|_| tempfile::tempdir().unwrap());
+    let writer = client(&wdir, &store, Role::Writer);
+    let db = writer
+        .database("app")
+        .history(Duration::from_secs(3600))
+        .open()
+        .await
+        .unwrap();
+    db.put(b"stock", b"10").await.unwrap();
+    let good = db.put(b"price", b"5").await.unwrap().lsn.unwrap();
+    db.compact().await.unwrap();
+    db.put(b"stock", b"0").await.unwrap();
+    db.delete(b"price").await.unwrap();
+
+    let replica = client(&rdir, &store, Role::Replica)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(replica.get(b"price").unwrap(), None);
+
+    let reach = db.history().await.unwrap();
+    assert_eq!((reach.from_lsn, reach.to_lsn), (0, 4));
+    assert_eq!(
+        replica.history().await.unwrap(),
+        reach,
+        "replicas can ask too"
+    );
+
+    let restored = db.restore(valkvedge::Point::Lsn(good)).await.unwrap();
+    assert_eq!((restored.from, restored.lsn), (2, 5));
+    assert_eq!(text(db.get(b"stock").unwrap()).as_deref(), Some("10"));
+    assert_eq!(text(db.get(b"price").unwrap()).as_deref(), Some("5"));
+
+    assert_eq!(replica.sync().await.unwrap(), 5);
+    assert_eq!(text(replica.get(b"price").unwrap()).as_deref(), Some("5"));
+    assert_eq!(
+        replica
+            .restore(valkvedge::Point::Lsn(1))
+            .await
+            .unwrap_err()
+            .code(),
+        "READ_ONLY"
+    );
+    let err = db.restore(valkvedge::Point::Lsn(99)).await.unwrap_err();
+    assert_eq!(err.code(), "NOT_IN_HISTORY");
+
+    // Writes go on, after the restored state.
+    assert_eq!(db.put(b"stock", b"9").await.unwrap().lsn, Some(6));
+}
+
+#[tokio::test]
+async fn a_branch_starts_from_a_past_state_and_then_goes_its_own_way() {
+    let store = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let kv = client(&dir, &store, Role::Writer);
+    let main = kv
+        .database("main")
+        .history(Duration::from_secs(3600))
+        .open()
+        .await
+        .unwrap();
+    main.put(b"config", b"v1").await.unwrap();
+    let before = main.put(b"users", b"3").await.unwrap().lsn.unwrap();
+    main.put(b"config", b"v2").await.unwrap();
+
+    let branch = kv.database("try-v1").open().await.unwrap();
+    let made = branch
+        .branch_from(&main, valkvedge::Point::Lsn(before))
+        .await
+        .unwrap();
+    assert_eq!(made.from, before);
+    assert_eq!(text(branch.get(b"config").unwrap()).as_deref(), Some("v1"));
+    assert_eq!(text(branch.get(b"users").unwrap()).as_deref(), Some("3"));
+
+    // Separate from here on.
+    branch.put(b"config", b"v1-fixed").await.unwrap();
+    assert_eq!(text(main.get(b"config").unwrap()).as_deref(), Some("v2"));
+    let rdir = tempfile::tempdir().unwrap();
+    let reader = client(&rdir, &store, Role::Replica)
+        .database("try-v1")
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(
+        text(reader.get(b"config").unwrap()).as_deref(),
+        Some("v1-fixed")
+    );
+
+    // Only into an empty database, and not from an encrypted one.
+    let again = branch
+        .branch_from(&main, valkvedge::Point::Lsn(before))
+        .await
+        .unwrap_err();
+    assert_eq!(again.code(), "UNSUPPORTED");
+    let secret = kv
+        .database("secret")
+        .encryption_key([7; 32])
+        .open()
+        .await
+        .unwrap();
+    secret.put(b"k", b"v").await.unwrap();
+    let empty = kv.database("copy-of-secret").open().await.unwrap();
+    let err = empty
+        .branch_from(&secret, valkvedge::Point::Lsn(1))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "UNSUPPORTED");
+}
+
+#[tokio::test]
+async fn the_history_moves_forward_by_itself_as_the_writer_compacts() {
+    let store = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let kv = ValkvEdge::builder(dir.path())
+        .options(Options {
+            writer: valkvedge::WriterConfig {
+                compact_after_segments: 2,
+                generation_grace: Duration::ZERO,
+                ..valkvedge::WriterConfig::default()
+            },
+            ..options()
+        })
+        .object_store(store.clone(), "tenant")
+        .build()
+        .unwrap();
+    let db = kv
+        .database("app")
+        .history(Duration::from_millis(200))
+        .open()
+        .await
+        .unwrap();
+    for i in 0..4u8 {
+        db.put(&[b'k', i], b"v").await.unwrap();
+    }
+    assert_eq!(db.history().await.unwrap().from_lsn, 0);
+
+    // Past the window and a quarter: the next compaction moves the base.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for i in 4..8u8 {
+        db.put(&[b'k', i], b"v").await.unwrap();
+    }
+    let started = std::time::Instant::now();
+    while db.history().await.unwrap().from_lsn == 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the base never moved"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let reach = db.history().await.unwrap();
+    assert!(reach.from_lsn > 0 && reach.to_lsn == 8, "{reach:?}");
+    // The scratch store it was rebuilt in is gone.
+    let scratch = dir.path().join(".scratch");
+    let started = std::time::Instant::now();
+    while std::fs::read_dir(&scratch).is_ok_and(|mut d| d.next().is_some()) {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "scratch left behind"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

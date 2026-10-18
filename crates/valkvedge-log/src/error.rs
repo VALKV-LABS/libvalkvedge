@@ -122,6 +122,10 @@ pub enum Error {
         /// The key, or the start of the range, that is not held.
         key: Vec<u8>,
     },
+    /// A restore or branch asked for a point the kept history does not
+    /// reach: before its start, or after the newest write.
+    #[error("not in the history: {0}")]
+    NotInHistory(String),
 }
 
 impl Error {
@@ -149,6 +153,7 @@ impl Error {
             Error::Unsupported(_) => "UNSUPPORTED",
             Error::ConditionFailed { .. } => "CONDITION_FAILED",
             Error::NotReplicated { .. } => "NOT_REPLICATED",
+            Error::NotInHistory(_) => "NOT_IN_HISTORY",
         }
     }
 

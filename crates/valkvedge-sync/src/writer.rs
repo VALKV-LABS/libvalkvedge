@@ -6,6 +6,7 @@
 //! each. A commit alone is written at once, so grouping adds no delay; under
 //! load it turns many object-store writes into one.
 
+use crate::history::{state_at, Point};
 use crate::pull::pull;
 use crate::state::StateStore;
 use std::collections::HashMap;
@@ -14,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, Mutex};
 use valkvedge_log::{
-    now_ms, ChainPos, Error, Frame, Hlc, HlcClock, Layout, LogWriter, Lsn, Node, Op, OpKind,
-    Origin, Record, RejectReason, ReplicaId, Result, Store,
+    now_ms, ChainPos, Error, Frame, Hlc, HlcClock, Layout, LogWriter, Lsn, Manifest, Node, Op,
+    OpKind, Origin, Record, RejectReason, ReplicaId, Result, SnapshotUpload, Store,
 };
 
 /// Tunables for a [`Writer`].
@@ -35,6 +36,10 @@ pub struct WriterConfig {
     /// commits carries. A single commit larger than this is still written,
     /// alone.
     pub max_group_bytes: usize,
+    /// How far back the history reaches, for restores and branches. Zero,
+    /// the default, keeps no history beyond `generation_grace`. The history
+    /// can reach up to a quarter further: see [`Writer::maintain_history`].
+    pub history: Duration,
 }
 
 impl Default for WriterConfig {
@@ -46,7 +51,72 @@ impl Default for WriterConfig {
             compact_after_bytes: 64 * 1024 * 1024,
             generation_grace: Duration::from_secs(24 * 3600),
             max_group_bytes: 16 * 1024 * 1024,
+            history: Duration::ZERO,
         }
+    }
+}
+
+/// Streams every record of `state` into `upload`, through `keep`, which may
+/// change a record or leave it out.
+async fn upload_state<T: StateStore>(
+    state: Arc<T>,
+    upload: &mut SnapshotUpload,
+    mut keep: impl FnMut(Record) -> Result<Option<Record>>,
+) -> Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(1024);
+    let scan = tokio::task::spawn_blocking(move || {
+        state.scan(&mut |record| {
+            tx.blocking_send(record)
+                .map_err(|_| Error::local("snapshot upload stopped"))
+        })
+    });
+    let mut result = Ok(());
+    while let Some(record) = rx.recv().await {
+        let pushed = match keep(record) {
+            Ok(Some(record)) => upload.push(record).await,
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = pushed {
+            result = Err(e);
+            break;
+        }
+    }
+    drop(rx);
+    let scanned = scan
+        .await
+        .map_err(|e| Error::local(format!("snapshot scan panicked: {e}")))?;
+    result?;
+    scanned
+}
+
+/// The generation the history's base should move to, if it is due, and the
+/// LSN to rebuild its state at when its own snapshot is not kept.
+fn base_due(manifest: &Manifest, now: u64, history_ms: u64) -> Option<(u64, Option<Lsn>)> {
+    let mut history: Vec<_> = manifest
+        .superseded
+        .iter()
+        .filter(|s| s.snapshot_lsn.is_some())
+        .collect();
+    history.sort_by_key(|s| s.generation);
+    let base = history.iter().find(|s| s.snapshot_parts.is_some())?;
+    // Ended more than a quarter of the history before the window began.
+    if now.saturating_sub(base.at_ms) < history_ms + history_ms / 4 {
+        return None;
+    }
+    let window_start = now.saturating_sub(history_ms);
+    match history.iter().find(|s| s.at_ms >= window_start) {
+        Some(needed) if needed.generation == base.generation => None,
+        Some(needed) => Some((
+            needed.generation,
+            needed
+                .snapshot_parts
+                .is_none()
+                .then_some(needed.snapshot_lsn?),
+        )),
+        // Every replaced generation ended before the window: the current
+        // snapshot is the base.
+        None => Some((manifest.generation, None)),
     }
 }
 
@@ -552,9 +622,123 @@ impl<S: StateStore> Writer<S> {
         let pos = log.install_snapshot(upload).await?;
         self.state.apply(&[], pos)?;
         self.state.purge_tombstones(cutoff)?;
-        log.delete_old_generations(self.config.generation_grace.as_millis() as u64)
-            .await?;
+        log.prune(
+            self.config.generation_grace.as_millis() as u64,
+            !self.config.history.is_zero(),
+        )
+        .await?;
         Ok(pos)
+    }
+
+    /// Replaces the database's contents with `source`'s, as a new generation
+    /// one LSN past the tail, and returns the new position. Writes wait while
+    /// this runs; writes made before it are not in the result unless
+    /// `source` has them. Replicas reload the database.
+    ///
+    /// With `keep_watermarks`, each replica's watermark becomes the higher of
+    /// `source`'s and the current one, so a push already applied is not
+    /// applied again. Without, the watermarks are dropped: for a branch,
+    /// whose replicas are all new.
+    pub async fn restore<T: StateStore>(
+        &self,
+        source: Arc<T>,
+        keep_watermarks: bool,
+    ) -> Result<ChainPos> {
+        let mut guard = self.log.lock().await;
+        let log = guard.as_mut().ok_or(Error::Fenced)?;
+        let mut upload = log.begin_snapshot();
+        let mut watermarks = HashMap::new();
+        upload_state(source.clone(), &mut upload, |record| match record {
+            Record::Watermark { replica, seq } if keep_watermarks => {
+                let seq = seq.max(self.state.watermark(&replica)?);
+                watermarks.insert(replica, seq);
+                Ok(Some(Record::Watermark { replica, seq }))
+            }
+            Record::Watermark { .. } => Ok(None),
+            entry => Ok(Some(entry)),
+        })
+        .await?;
+        let pos = log.install_restore(upload).await?;
+
+        // The writer's own copy becomes the restored state too.
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            state.begin_reset()?;
+            let mut batch = Vec::with_capacity(1024);
+            source.scan(&mut |record| {
+                match record {
+                    Record::Watermark { replica, .. } => {
+                        if let Some(seq) = watermarks.get(&replica) {
+                            batch.push(Record::Watermark { replica, seq: *seq });
+                        }
+                    }
+                    entry => batch.push(entry),
+                }
+                if batch.len() == 1024 {
+                    state.load(&batch)?;
+                    batch.clear();
+                }
+                Ok(())
+            })?;
+            state.load(&batch)?;
+            state.finish_reset(pos)
+        })
+        .await
+        .map_err(|e| Error::local(format!("restore load panicked: {e}")))??;
+        Ok(pos)
+    }
+
+    /// True when the history's base should move forward:
+    /// [`Writer::maintain_history`] then has work to do.
+    pub async fn history_due(&self) -> bool {
+        if self.config.history.is_zero() {
+            return false;
+        }
+        let guard = self.log.lock().await;
+        guard
+            .as_ref()
+            .is_some_and(|log| base_due(log.manifest(), now_ms(), self.history_ms()).is_some())
+    }
+
+    fn history_ms(&self) -> u64 {
+        self.config.history.as_millis() as u64
+    }
+
+    /// Moves the history's base forward once it is a quarter of the history
+    /// older than needed, so the history keeps one snapshot and the log since
+    /// rather than growing. When the new base's own snapshot was not kept,
+    /// its state is rebuilt in `scratch` from the old base and the log, and
+    /// uploaded. Writes continue meanwhile. Returns whether it did anything.
+    pub async fn maintain_history<T: StateStore>(&self, scratch: Arc<T>) -> Result<bool> {
+        if self.config.history.is_zero() {
+            return Ok(false);
+        }
+        let due = {
+            let guard = self.log.lock().await;
+            let log = guard.as_ref().ok_or(Error::Fenced)?;
+            base_due(log.manifest(), now_ms(), self.history_ms())
+        };
+        let Some((generation, rebuild)) = due else {
+            return Ok(false);
+        };
+        let parts = match rebuild {
+            None => None,
+            Some(lsn) => {
+                state_at(&self.store, &self.layout, Point::Lsn(lsn), scratch.as_ref()).await?;
+                let mut upload = {
+                    let guard = self.log.lock().await;
+                    guard.as_ref().ok_or(Error::Fenced)?.begin_base(generation)
+                };
+                upload_state(scratch, &mut upload, |record| Ok(Some(record))).await?;
+                Some(upload.finish().await?)
+            }
+        };
+        let mut guard = self.log.lock().await;
+        let log = guard.as_mut().ok_or(Error::Fenced)?;
+        log.advance_base(generation, parts).await?;
+        log.prune(self.config.generation_grace.as_millis() as u64, true)
+            .await?;
+        Ok(true)
     }
 
     /// Gives up ownership cleanly. The writer cannot be used afterwards.

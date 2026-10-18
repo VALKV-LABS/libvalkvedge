@@ -133,6 +133,13 @@ impl SnapshotUpload {
         Ok(())
     }
 
+    /// Uploads what is buffered and returns the parts, in order. For a
+    /// snapshot started with [`LogWriter::begin_base`].
+    pub async fn finish(mut self) -> Result<Vec<PartRef>> {
+        self.flush().await?;
+        Ok(self.parts)
+    }
+
     async fn flush(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -346,23 +353,64 @@ impl LogWriter {
         }
     }
 
+    /// Starts uploading a snapshot for `generation`, an older generation
+    /// whose own snapshot is no longer kept: the state at its snapshot LSN,
+    /// rebuilt from the history, to become the history's base.
+    pub fn begin_base(&self, generation: u64) -> SnapshotUpload {
+        SnapshotUpload {
+            store: self.store.clone(),
+            layout: self.layout.clone(),
+            generation,
+            parts: Vec::new(),
+            buffer: Vec::new(),
+            buffered: 0,
+        }
+    }
+
     /// Makes an uploaded snapshot the current generation. The snapshot must
     /// describe the state at the writer's current tail.
-    pub async fn install_snapshot(&mut self, mut upload: SnapshotUpload) -> Result<ChainPos> {
+    pub async fn install_snapshot(&mut self, upload: SnapshotUpload) -> Result<ChainPos> {
+        let lsn = self.pos.applied_lsn;
+        self.install(upload, lsn, false).await
+    }
+
+    /// Makes an uploaded snapshot of another state the current generation,
+    /// one LSN past the tail: a restore, or a branch's first state. No log
+    /// leads to it, so replicas reload it rather than catching up, and it is
+    /// kept as long as its generation is.
+    pub async fn install_restore(&mut self, upload: SnapshotUpload) -> Result<ChainPos> {
+        let lsn = self.pos.applied_lsn + 1;
+        self.install(upload, lsn, true).await
+    }
+
+    async fn install(
+        &mut self,
+        mut upload: SnapshotUpload,
+        lsn: Lsn,
+        restored: bool,
+    ) -> Result<ChainPos> {
         self.check_usable()?;
         upload.flush().await?;
+        let now = now_ms();
         let mut next = self.manifest.clone();
         next.superseded.push(Superseded {
             generation: self.manifest.generation,
-            at_ms: now_ms(),
+            at_ms: now,
+            snapshot_lsn: Some(self.manifest.snapshot_lsn),
+            snapshot_ms: self.manifest.snapshot_ms,
+            snapshot_parts: Some(self.manifest.snapshot_parts.clone()),
+            restored: self.manifest.restored,
         });
         next.generation = upload.generation;
-        next.snapshot_lsn = self.pos.applied_lsn;
+        next.snapshot_lsn = lsn;
         next.snapshot_parts = upload.parts;
+        next.snapshot_ms = Some(now);
+        next.restored = restored;
         self.write_manifest(next).await?;
         self.pos.generation = self.manifest.generation;
         self.pos.next_seq = 0;
         self.pos.prev_checksum = 0;
+        self.pos.applied_lsn = lsn;
         self.log_bytes = 0;
         Ok(self.pos)
     }
@@ -402,32 +450,107 @@ impl LogWriter {
 
     /// Deletes generations that were superseded more than `grace_ms` ago.
     pub async fn delete_old_generations(&mut self, grace_ms: u64) -> Result<usize> {
+        self.prune(grace_ms, false).await
+    }
+
+    /// Deletes what neither replicas nor restores need any more. Returns how
+    /// many generations were deleted.
+    ///
+    /// Without history, a generation is deleted once it was replaced more
+    /// than `grace_ms` ago. With history, the snapshots of replaced
+    /// generations are deleted at once, except the base (the oldest one
+    /// kept) and those of restores; generations older than the base are
+    /// deleted once past `grace_ms`. [`LogWriter::advance_base`] moves the
+    /// base forward. Replicas only ever need the current snapshot and the
+    /// logs.
+    pub async fn prune(&mut self, grace_ms: u64, history: bool) -> Result<usize> {
         self.check_usable()?;
         let now = now_ms();
-        let (expired, keep): (Vec<_>, Vec<_>) = self
+        let aged = |s: &Superseded| now.saturating_sub(s.at_ms) >= grace_ms;
+        let base = self
             .manifest
             .superseded
             .iter()
-            .cloned()
-            .partition(|s| now.saturating_sub(s.at_ms) >= grace_ms);
-        if expired.is_empty() {
+            .filter(|s| s.snapshot_lsn.is_some() && s.snapshot_parts.is_some())
+            .map(|s| s.generation)
+            .min();
+        let mut next = self.manifest.clone();
+        let mut whole = Vec::new();
+        let mut parts = Vec::new();
+        let mut keep = Vec::new();
+        for mut old in next.superseded.drain(..) {
+            let outside = !history
+                || old.snapshot_lsn.is_none()
+                || base.is_none_or(|base| old.generation < base);
+            if outside && aged(&old) {
+                whole.push(old.generation);
+                continue;
+            }
+            if history && Some(old.generation) != base && !old.restored {
+                parts.extend(old.snapshot_parts.take().into_iter().flatten());
+            }
+            keep.push(old);
+        }
+        if whole.is_empty() && parts.is_empty() {
             return Ok(0);
         }
-        // Drop them from the manifest first, so no reader is pointed at a
-        // generation that is being deleted.
-        let mut next = self.manifest.clone();
         next.superseded = keep;
+        self.drop_objects(next, &whole, &parts).await?;
+        Ok(whole.len())
+    }
+
+    /// Makes `generation` the base of the history. `parts` is its snapshot,
+    /// uploaded with [`LogWriter::begin_base`], when it had none kept. The
+    /// snapshots of older generations are deleted, and so, once past grace,
+    /// are those generations at the next [`LogWriter::prune`].
+    pub async fn advance_base(
+        &mut self,
+        generation: u64,
+        parts: Option<Vec<PartRef>>,
+    ) -> Result<()> {
+        self.check_usable()?;
+        let mut next = self.manifest.clone();
+        let mut dropped = Vec::new();
+        for old in &mut next.superseded {
+            if old.generation < generation {
+                dropped.extend(old.snapshot_parts.take().into_iter().flatten());
+            } else if old.generation == generation {
+                if let Some(parts) = &parts {
+                    old.snapshot_parts = Some(parts.clone());
+                }
+                if old.snapshot_parts.is_none() {
+                    return Err(Error::local(format!(
+                        "generation {generation} has no snapshot to be the base"
+                    )));
+                }
+            }
+        }
+        self.drop_objects(next, &[], &dropped).await
+    }
+
+    /// Writes `next`, then deletes whole generations and snapshot parts it no
+    /// longer names. The manifest goes first, so no reader is pointed at
+    /// something that is being deleted.
+    async fn drop_objects(
+        &mut self,
+        next: Manifest,
+        generations: &[u64],
+        parts: &[PartRef],
+    ) -> Result<()> {
         self.write_manifest(next).await?;
-        for old in &expired {
+        for generation in generations {
             for key in self
                 .store
-                .list(&self.layout.generation_prefix(old.generation))
+                .list(&self.layout.generation_prefix(*generation))
                 .await?
             {
                 self.store.delete(&key).await?;
             }
         }
-        Ok(expired.len())
+        for part in parts {
+            self.store.delete(&part.key).await?;
+        }
+        Ok(())
     }
 
     /// Gives up ownership cleanly so another node can take over at once.
