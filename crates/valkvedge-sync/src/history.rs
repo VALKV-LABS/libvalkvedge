@@ -6,8 +6,8 @@
 
 use crate::state::StateStore;
 use valkvedge_log::{
-    read_manifest, read_segments, read_snapshot_part, ChainPos, Error, Layout, Lsn, Manifest,
-    PartRef, Result, Segment, Store,
+    read_manifest, read_segments, read_snapshot_part, ChainPos, Error, Frame, Layout, Lsn,
+    Manifest, PartRef, Result, Segment, Store,
 };
 
 /// A point in a database's history.
@@ -41,10 +41,13 @@ struct Generation {
     snapshot_ms: Option<u64>,
     /// Its snapshot, when kept.
     parts: Option<Vec<PartRef>>,
+    /// Its snapshot is a restore: no log leads to it.
+    restored: bool,
 }
 
-/// The generations in the history, oldest first, starting at the base.
-fn generations(manifest: &Manifest) -> Vec<Generation> {
+/// The generations whose logs are kept, oldest first, ending with the
+/// current one.
+fn chain(manifest: &Manifest) -> Vec<Generation> {
     let mut all: Vec<Generation> = manifest
         .superseded
         .iter()
@@ -54,6 +57,7 @@ fn generations(manifest: &Manifest) -> Vec<Generation> {
                 snapshot_lsn: s.snapshot_lsn?,
                 snapshot_ms: s.snapshot_ms,
                 parts: s.snapshot_parts.clone(),
+                restored: s.restored,
             })
         })
         .collect();
@@ -62,6 +66,7 @@ fn generations(manifest: &Manifest) -> Vec<Generation> {
         snapshot_lsn: manifest.snapshot_lsn,
         snapshot_ms: manifest.snapshot_ms,
         parts: Some(manifest.snapshot_parts.clone()),
+        restored: manifest.restored,
     });
     all.sort_by_key(|g| g.generation);
     // The generations must follow one another; history from before a gap
@@ -70,7 +75,12 @@ fn generations(manifest: &Manifest) -> Vec<Generation> {
         .windows(2)
         .rposition(|pair| pair[1].generation != pair[0].generation + 1)
         .map_or(0, |gap| gap + 1);
-    let mut all = all.split_off(start);
+    all.split_off(start)
+}
+
+/// The generations in the history, oldest first, starting at the base.
+fn generations(manifest: &Manifest) -> Vec<Generation> {
+    let mut all = chain(manifest);
     let base = all.iter().position(|g| g.parts.is_some()).unwrap_or(0);
     all.split_off(base)
 }
@@ -228,4 +238,95 @@ pub async fn state_at<S: StateStore>(
         }
     }
     Ok(applied)
+}
+
+/// What follows a point in a database's log. See [`changes`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Changes {
+    /// The frames after the point, oldest first.
+    pub frames: Vec<Frame>,
+    /// Set when the database was restored right after the last of `frames`
+    /// (or right after the point, when there are none): its whole state was
+    /// replaced at this LSN, and no frames lead there. A follower reads the
+    /// state again and goes on from this LSN.
+    pub reset: Option<Lsn>,
+}
+
+/// Reads up to `limit` frames after `after`, for a follower of the
+/// database's changes. Frames are read across generations while their logs
+/// are kept (the history window, or the grace after a compaction), and
+/// stop at a restore, which [`Changes::reset`] reports.
+///
+/// Fails with `NOT_IN_HISTORY` when the frames right after `after` are no
+/// longer kept.
+pub async fn changes(store: &Store, layout: &Layout, after: Lsn, limit: usize) -> Result<Changes> {
+    let (manifest, _) = read_manifest(store, layout)
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("database at {}", layout.prefix())))?;
+    let chain = chain(&manifest);
+    // The generation holding the frame after `after`: the newest one
+    // starting at or before it.
+    let Some(mut within) = chain.iter().rposition(|g| g.snapshot_lsn <= after) else {
+        return Err(Error::NotInHistory(format!(
+            "changes after LSN {after} are no longer kept; the oldest kept follow LSN {}",
+            chain[0].snapshot_lsn
+        )));
+    };
+    let limit = limit.max(1);
+    let mut out = Changes::default();
+    let mut last = after;
+    loop {
+        let g = &chain[within];
+        // A generation's frames end where the next one's snapshot is.
+        let end = chain.get(within + 1).map(|next| next.snapshot_lsn);
+        let (mut next_seq, mut prev_checksum) = (0, 0);
+        'segments: while end.is_none_or(|end| last < end) {
+            let page = read_segments(
+                store,
+                layout,
+                g.generation,
+                next_seq,
+                prev_checksum,
+                SEGMENTS_PER_READ,
+            )
+            .await?;
+            let Some(tail) = page.last() else {
+                break;
+            };
+            (next_seq, prev_checksum) = (tail.seq + 1, tail.checksum);
+            for read in page {
+                if read.segment.last_lsn <= last {
+                    continue;
+                }
+                for frame in read.segment.frames {
+                    if frame.lsn <= last || end.is_some_and(|end| frame.lsn > end) {
+                        continue;
+                    }
+                    if frame.lsn != last + 1 {
+                        return Err(Error::corrupt(format!(
+                            "the log jumps from LSN {last} to {} in generation {}",
+                            frame.lsn, g.generation
+                        )));
+                    }
+                    last = frame.lsn;
+                    out.frames.push(frame);
+                    if out.frames.len() >= limit {
+                        break 'segments;
+                    }
+                }
+            }
+        }
+        if out.frames.len() >= limit {
+            break;
+        }
+        match chain.get(within + 1) {
+            None => break,
+            Some(next) if next.restored => {
+                out.reset = Some(next.snapshot_lsn);
+                break;
+            }
+            Some(_) => within += 1,
+        }
+    }
+    Ok(out)
 }

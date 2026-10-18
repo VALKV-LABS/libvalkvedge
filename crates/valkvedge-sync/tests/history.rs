@@ -6,7 +6,7 @@ use valkvedge_log::{
     now_ms, read_manifest, HlcClock, Layout, LeaseConfig, Node, OpKind, ReplicaId, Store,
 };
 use valkvedge_sync::{
-    history, pull, state_at, Change, MemState, Point, StateStore, Writer, WriterConfig,
+    changes, history, pull, state_at, Change, MemState, Point, StateStore, Writer, WriterConfig,
 };
 
 fn fast() -> LeaseConfig {
@@ -285,4 +285,61 @@ async fn a_time_before_a_restore_is_found_in_the_generation_before_it() {
         .await
         .unwrap();
     assert_eq!((lsn, text(&scratch, "a").as_deref()), (1, Some("1")));
+}
+
+fn lsns(changes: &valkvedge_sync::Changes) -> Vec<u64> {
+    changes.frames.iter().map(|f| f.lsn).collect()
+}
+
+#[tokio::test]
+async fn changes_are_followed_across_compactions_and_stop_at_a_restore() {
+    let store = Store::memory();
+    let w = writer(&store, Duration::from_secs(3600)).await;
+    w.commit(vec![put("a", "1")]).await.unwrap(); // 1
+    w.commit(vec![put("b", "1")]).await.unwrap(); // 2
+    w.compact().await.unwrap();
+    w.commit(vec![del("a")]).await.unwrap(); // 3
+
+    let all = changes(&store, &layout(), 0, 100).await.unwrap();
+    assert_eq!((lsns(&all), all.reset), (vec![1, 2, 3], None));
+    assert_eq!(all.frames[2].ops[0].kind, OpKind::Delete);
+    assert_eq!(all.frames[2].ops[0].key, b"a");
+    let page = changes(&store, &layout(), 1, 1).await.unwrap();
+    assert_eq!(lsns(&page), vec![2]);
+    let page = changes(&store, &layout(), 2, 100).await.unwrap();
+    assert_eq!(lsns(&page), vec![3]);
+    let none = changes(&store, &layout(), 3, 100).await.unwrap();
+    assert_eq!((lsns(&none), none.reset), (vec![], None));
+
+    let scratch = Arc::new(MemState::new());
+    state_at(&store, &layout(), Point::Lsn(1), scratch.as_ref())
+        .await
+        .unwrap();
+    w.restore(scratch, true).await.unwrap(); // 4
+    w.commit(vec![put("c", "1")]).await.unwrap(); // 5
+
+    // A follower reads up to the restore, is told to read the state again,
+    // and goes on after it.
+    let page = changes(&store, &layout(), 2, 100).await.unwrap();
+    assert_eq!((lsns(&page), page.reset), (vec![3], Some(4)));
+    let page = changes(&store, &layout(), 3, 100).await.unwrap();
+    assert_eq!((lsns(&page), page.reset), (vec![], Some(4)));
+    let page = changes(&store, &layout(), 4, 100).await.unwrap();
+    assert_eq!((lsns(&page), page.reset), (vec![5], None));
+}
+
+#[tokio::test]
+async fn changes_whose_log_is_gone_are_not_in_history() {
+    let store = Store::memory();
+    // No history and no grace: a compaction deletes the replaced log.
+    let w = writer(&store, Duration::ZERO).await;
+    w.commit(vec![put("a", "1")]).await.unwrap(); // 1
+    w.commit(vec![put("b", "1")]).await.unwrap(); // 2
+    w.compact().await.unwrap();
+    w.commit(vec![put("c", "1")]).await.unwrap(); // 3
+
+    let err = changes(&store, &layout(), 1, 100).await.unwrap_err();
+    assert_eq!(err.code(), "NOT_IN_HISTORY");
+    let page = changes(&store, &layout(), 2, 100).await.unwrap();
+    assert_eq!(lsns(&page), vec![3]);
 }

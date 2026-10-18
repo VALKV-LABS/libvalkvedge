@@ -17,7 +17,7 @@ mod pull;
 mod state;
 mod writer;
 
-pub use history::{history, state_at, History, Point};
+pub use history::{changes, history, state_at, Changes, History, Point};
 
 pub use pull::{pull, remote_head, PullOutcome};
 pub use state::{MemState, StateStore};
