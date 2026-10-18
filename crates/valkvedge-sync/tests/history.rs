@@ -263,3 +263,26 @@ async fn the_base_moves_forward_and_older_generations_are_deleted() {
     assert_eq!(err.code(), "NOT_IN_HISTORY");
     assert_eq!(scratch.position().unwrap().applied_lsn, 2, "left as it was");
 }
+
+#[tokio::test]
+async fn a_time_before_a_restore_is_found_in_the_generation_before_it() {
+    let store = Store::memory();
+    let w = writer(&store, Duration::from_secs(3600)).await;
+    w.commit(vec![put("a", "1")]).await.unwrap(); // 1
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let then = now_ms();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    w.commit(vec![put("a", "2")]).await.unwrap(); // 2
+    let scratch = Arc::new(MemState::new());
+    state_at(&store, &layout(), Point::Lsn(1), scratch.as_ref())
+        .await
+        .unwrap();
+    w.restore(scratch, true).await.unwrap(); // 3
+    w.commit(vec![put("a", "3")]).await.unwrap(); // 4
+
+    let scratch = MemState::new();
+    let lsn = state_at(&store, &layout(), Point::Time(then), &scratch)
+        .await
+        .unwrap();
+    assert_eq!((lsn, text(&scratch, "a").as_deref()), (1, Some("1")));
+}
