@@ -284,6 +284,15 @@ point)` does the same into an empty database, without watermarks: a copy that th
 goes its own way. Encrypted databases cannot be branched, since values are sealed to
 the database's name.
 
+**Following changes.** `valkvedge_sync::changes(store, layout, after, limit)` reads the
+frames after an LSN, in order, for a program that follows a database's changes rather
+than holding a copy. It reads across generations while their logs are kept: within the
+history window, or for the grace after a compaction without one. A frame list stops at a
+restore: `Changes::reset` is then the restore's LSN, and the follower reads the whole
+state again and goes on from there. When the frames after the LSN are no longer kept,
+it fails with `NOT_IN_HISTORY`. Values are as stored: ciphertext for an encrypted
+database.
+
 **Partial replicas.** A replica opened with `DatabaseBuilder::prefixes` keeps only the
 keys under those prefixes (at most 16). It reads the same segments and snapshot parts,
 and the local store drops every operation and snapshot entry outside the prefixes as it
