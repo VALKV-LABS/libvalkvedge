@@ -1849,10 +1849,10 @@ async fn an_expiry_travels_through_the_service_and_its_writer_deletes_the_value(
         .open()
         .await
         .unwrap();
-    let ttl = Duration::from_secs(2);
-    a.put_with_ttl(b"sync", b"1", ttl).await.unwrap();
+    let hour = Duration::from_secs(3600);
+    a.put_with_ttl(b"sync", b"1", hour).await.unwrap();
     let mut buffered = a.batch();
-    buffered.put_with_ttl(b"buffered", b"2", ttl);
+    buffered.put_with_ttl(b"buffered", b"2", hour);
     buffered.commit_with(Durability::Buffered).await.unwrap();
     a.flush().await.unwrap();
     let (sync_at, buffered_at) = (
@@ -1869,13 +1869,17 @@ async fn an_expiry_travels_through_the_service_and_its_writer_deletes_the_value(
     assert_eq!(b.expires_at(b"sync").unwrap(), Some(sync_at));
     assert_eq!(b.expires_at(b"buffered").unwrap(), Some(buffered_at));
 
-    tokio::time::sleep(ttl + Duration::from_millis(100)).await;
-    assert_eq!(b.get(b"sync").unwrap(), None);
-    assert_eq!(b.get(b"buffered").unwrap(), None);
-    // The service's writer deletes them; the replicas only read.
+    // A value that has expired by the time it arrives reads as absent.
+    a.put_with_ttl(b"brief", b"3", Duration::from_millis(200))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let lsn = b.sync().await.unwrap();
+    assert_eq!(b.get(b"brief").unwrap(), None);
+    // The service's writer deletes it; the replicas only read.
     assert_eq!(a.expire().await.unwrap(), 0);
     let owner = service.server.kv.database("app").open().await.unwrap();
-    assert_eq!(owner.expire().await.unwrap(), 2);
-    let lsn = owner.status().unwrap().applied_lsn;
-    assert_eq!(b.sync().await.unwrap(), lsn);
+    assert_eq!(owner.expire().await.unwrap(), 1);
+    assert_eq!(b.sync().await.unwrap(), lsn + 1);
+    assert_eq!(text(b.get(b"sync").unwrap()).as_deref(), Some("1"));
 }

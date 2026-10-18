@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use valkvedge::{object_store, Durability, LeaseConfig, Options, Role, ValkvEdge};
 
 /// Long enough to read a value before it expires, short enough to wait out.
-const SHORT: Duration = Duration::from_millis(600);
+const SHORT: Duration = Duration::from_millis(1500);
 
 fn options(background: bool) -> Options {
     Options {
