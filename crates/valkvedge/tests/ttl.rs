@@ -52,8 +52,10 @@ async fn an_expired_value_reads_as_absent_everywhere_and_the_writer_deletes_it()
     db.put(b"keep", b"1").await.unwrap(); // 2
 
     let at = db.expires_at(b"session").unwrap().expect("expires");
+    // Stored to the millisecond.
+    let ms = Duration::from_millis(1);
     assert!(
-        at >= before + hour && at <= SystemTime::now() + hour,
+        at + ms > before + hour && at <= SystemTime::now() + hour,
         "{at:?}"
     );
     assert_eq!(db.expires_at(b"keep").unwrap(), None);
