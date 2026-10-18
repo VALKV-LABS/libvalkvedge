@@ -2130,6 +2130,7 @@ dependencies = [
 name = "valkvedge-sync"
 version = "0.1.0"
 dependencies = [
+ "object_store",
  "tokio",
  "tracing",
  "valkvedge-log",

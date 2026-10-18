@@ -1,12 +1,18 @@
 //! The writer role: orders sync writes, resolves pushed writes with
 //! last-write-wins, and compacts the log.
+//!
+//! Sync commits are grouped: while one segment is being written, commits
+//! that arrive wait, and the next segment carries all of them, one frame
+//! each. A commit alone is written at once, so grouping adds no delay; under
+//! load it turns many object-store writes into one.
 
 use crate::pull::pull;
 use crate::state::StateStore;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use valkvedge_log::{
     now_ms, ChainPos, Error, Frame, Hlc, HlcClock, Layout, LogWriter, Lsn, Node, Op, OpKind,
     Origin, Record, RejectReason, ReplicaId, Result, Store,
@@ -25,6 +31,10 @@ pub struct WriterConfig {
     pub compact_after_bytes: u64,
     /// How long a superseded generation is kept for replicas that are behind.
     pub generation_grace: Duration,
+    /// The most keys and values, in bytes, that one segment of grouped sync
+    /// commits carries. A single commit larger than this is still written,
+    /// alone.
+    pub max_group_bytes: usize,
 }
 
 impl Default for WriterConfig {
@@ -35,7 +45,45 @@ impl Default for WriterConfig {
             compact_after_segments: 512,
             compact_after_bytes: 64 * 1024 * 1024,
             generation_grace: Duration::from_secs(24 * 3600),
+            max_group_bytes: 16 * 1024 * 1024,
         }
+    }
+}
+
+/// Counts of sync commits and of the segments they were written in, for the
+/// writers that share it. More commits than segments means commits were
+/// grouped, and the object store was written fewer times.
+#[derive(Debug, Default)]
+pub struct CommitCounters {
+    commits: AtomicU64,
+    segments: AtomicU64,
+}
+
+impl CommitCounters {
+    /// Sync commits written.
+    pub fn commits(&self) -> u64 {
+        self.commits.load(Ordering::Relaxed)
+    }
+
+    /// Segments those commits were written in.
+    pub fn segments(&self) -> u64 {
+        self.segments.load(Ordering::Relaxed)
+    }
+}
+
+/// A sync commit waiting for the next segment.
+struct Pending {
+    changes: Vec<Change>,
+    conditions: Vec<Condition>,
+    reply: oneshot::Sender<Result<(Lsn, Vec<Hlc>)>>,
+}
+
+impl Pending {
+    fn bytes(&self) -> usize {
+        self.changes
+            .iter()
+            .map(|c| c.key.len() + c.value.len())
+            .sum()
     }
 }
 
@@ -101,6 +149,9 @@ pub struct Writer<S: StateStore> {
     clock: Arc<HlcClock>,
     config: WriterConfig,
     log: Mutex<Option<LogWriter>>,
+    /// Sync commits waiting for the next segment, oldest first.
+    queue: std::sync::Mutex<Vec<Pending>>,
+    counters: Arc<CommitCounters>,
 }
 
 impl<S: StateStore> std::fmt::Debug for Writer<S> {
@@ -141,7 +192,21 @@ impl<S: StateStore> Writer<S> {
             clock,
             config,
             log: Mutex::new(Some(log)),
+            queue: std::sync::Mutex::new(Vec::new()),
+            counters: Arc::default(),
         })
+    }
+
+    /// Counts this writer's commits into `counters`, shared with other
+    /// writers, instead of counters of its own.
+    pub fn with_counters(mut self, counters: Arc<CommitCounters>) -> Self {
+        self.counters = counters;
+        self
+    }
+
+    /// How many sync commits this writer has written, and in how many segments.
+    pub fn counters(&self) -> &Arc<CommitCounters> {
+        &self.counters
     }
 
     /// The state this writer maintains.
@@ -203,25 +268,145 @@ impl<S: StateStore> Writer<S> {
     /// and the timestamp each change was stamped with, in order.
     ///
     /// The conditions are checked under the same lock that orders commits,
-    /// against state that already holds every earlier write, so nothing can
-    /// change a key between the check and the write. If any condition fails,
-    /// nothing is written and the error is `CONDITION_FAILED`.
+    /// against state that already holds every earlier write, including the
+    /// earlier commits of the same group, so nothing can change a key between
+    /// the check and the write. If any condition fails, nothing is written
+    /// and the error is `CONDITION_FAILED`.
+    ///
+    /// Commits made while a segment is being written are grouped into the
+    /// next one. If that write fails, every commit in the group fails with
+    /// the same error. If the call is cancelled after its group has started,
+    /// the commits grouped with it fail as `UNAVAILABLE`, with an unknown
+    /// outcome, as a cancelled commit of their own would.
     pub async fn commit_if(
         &self,
         changes: Vec<Change>,
         conditions: &[Condition],
     ) -> Result<(Lsn, Vec<Hlc>)> {
-        let mut guard = self.log.lock().await;
-        let log = guard.as_mut().ok_or(Error::Fenced)?;
+        let (reply, mut answer) = oneshot::channel();
+        self.queue.lock().expect("queue lock").push(Pending {
+            changes,
+            conditions: conditions.to_vec(),
+            reply,
+        });
+        loop {
+            tokio::select! {
+                // An earlier group may already have written this commit.
+                biased;
+                answered = &mut answer => {
+                    return answered.unwrap_or_else(|_| Err(Error::Unavailable(
+                        "the group this write was in was interrupted; it may or may not have been stored".into(),
+                    )));
+                }
+                mut guard = self.log.lock() => {
+                    let group = self.take_group();
+                    // Empty: this commit was in the group just written, and
+                    // its answer is waiting.
+                    if !group.is_empty() {
+                        self.write_group(&mut guard, group).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The commits for the next segment: the oldest waiting, up to
+    /// `max_group_bytes`, and always at least one. Commits whose caller has
+    /// given up are dropped unwritten.
+    fn take_group(&self) -> Vec<Pending> {
+        let mut queue = self.queue.lock().expect("queue lock");
+        queue.retain(|pending| !pending.reply.is_closed());
+        let mut bytes = 0;
+        let mut take = 0;
+        for pending in queue.iter() {
+            bytes += pending.bytes();
+            if take > 0 && bytes > self.config.max_group_bytes {
+                break;
+            }
+            take += 1;
+        }
+        queue.drain(..take).collect()
+    }
+
+    /// Writes one group of commits as one segment and answers each.
+    async fn write_group(&self, guard: &mut Option<LogWriter>, group: Vec<Pending>) {
+        let Some(log) = guard.as_mut() else {
+            for pending in group {
+                let _ = pending.reply.send(Err(Error::Fenced));
+            }
+            return;
+        };
+        // What earlier commits of this group did to each key: its new
+        // version, and whether it is live (false after a delete).
+        let mut written: HashMap<Vec<u8>, (Hlc, bool)> = HashMap::new();
+        let mut frames = Vec::new();
+        let mut accepted = Vec::new();
+        let mut lsn = log.next_lsn();
+        for pending in group {
+            let Pending {
+                changes,
+                conditions,
+                reply,
+            } = pending;
+            match self.stamp(&mut written, changes, &conditions) {
+                Ok((ops, stamps)) => {
+                    frames.push(Frame {
+                        lsn,
+                        commit_hlc: self.clock.now(),
+                        origin: None,
+                        ops,
+                    });
+                    accepted.push((reply, lsn, stamps));
+                    lsn += 1;
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            }
+        }
+        if frames.is_empty() {
+            return;
+        }
+        let outcome = self.append(log, frames).await;
+        if outcome.is_ok() {
+            self.counters
+                .commits
+                .fetch_add(accepted.len() as u64, Ordering::Relaxed);
+            self.counters.segments.fetch_add(1, Ordering::Relaxed);
+        }
+        for (reply, lsn, stamps) in accepted {
+            let _ = reply.send(match &outcome {
+                Ok(_) => Ok((lsn, stamps)),
+                Err(e) => Err(e.clone()),
+            });
+        }
+    }
+
+    /// Checks one commit's conditions and stamps its changes, against the
+    /// state as earlier commits of the group leave it.
+    fn stamp(
+        &self,
+        written: &mut HashMap<Vec<u8>, (Hlc, bool)>,
+        changes: Vec<Change>,
+        conditions: &[Condition],
+    ) -> Result<(Vec<Op>, Vec<Hlc>)> {
         for condition in conditions {
-            if self.state.live_version(&condition.key)? != condition.version {
+            let live = match written.get(&condition.key) {
+                Some((hlc, live)) => live.then_some(*hlc),
+                None => self.state.live_version(&condition.key)?,
+            };
+            if live != condition.version {
                 return Err(Error::ConditionFailed {
                     key: condition.key.clone(),
                 });
             }
         }
         for change in &changes {
-            if let Some(current) = self.state.version_of(&change.key)? {
+            let current = match written.get(&change.key) {
+                Some((hlc, _)) => Some(*hlc),
+                None => self.state.version_of(&change.key)?,
+            };
+            if let Some(current) = current {
                 self.clock.observe(&current);
             }
         }
@@ -234,14 +419,11 @@ impl<S: StateStore> Writer<S> {
                 hlc: self.clock.now(),
             })
             .collect();
+        for op in &ops {
+            written.insert(op.key.clone(), (op.hlc, op.kind == OpKind::Put));
+        }
         let stamps = ops.iter().map(|op| op.hlc).collect();
-        let frame = Frame {
-            lsn: log.next_lsn(),
-            commit_hlc: self.clock.now(),
-            origin: None,
-            ops,
-        };
-        Ok((self.append(log, vec![frame]).await?, stamps))
+        Ok((ops, stamps))
     }
 
     /// Applies entries from a replica's outbox.

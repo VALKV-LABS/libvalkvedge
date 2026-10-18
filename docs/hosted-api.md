@@ -30,8 +30,11 @@ Conditional writes (`Batch::if_version`, `Database::update`) are checked by the
 service, against the newest data. If the local copy was behind and the condition
 fails, the library brings the copy up to date before returning `CONDITION_FAILED`, so
 the next read sees the value that won. `Database::watch` reports changes as they
-arrive from the service, which with the background task running is about once per
-`pull_interval`.
+arrive from the service. With the background task running, an open database is
+followed: the library asks the service for what comes after its copy and the service
+answers as soon as there is something (see *Waiting for changes* below), so changes
+arrive within moments of being written. Against a service that does not hold requests,
+the library polls every `pull_interval` instead.
 
 ## Replicas you do not control: tokens
 
@@ -109,7 +112,7 @@ Every request is `Authorization: Bearer <api key or token>` under `/v1/db/{datab
 | `POST /commit` | One atomic sync write | `{ "lsn": 42, "versions": ["…"] }` |
 | `POST /push` | Hand over outbox entries | `{ "watermark", "lsn", "entries": [{ "seq", "results": [...] }] }` |
 | `GET /head` | Newest LSN | `{ "generation", "lsn" }` |
-| `GET /log?after={lsn}` | Frames after an LSN | Binary: one [segment](format.md#segment), with the generation in `x-edgekv-generation` |
+| `GET /log?after={lsn}&wait_ms={ms}` | Frames after an LSN; `wait_ms` is optional | Binary: one [segment](format.md#segment), with the generation in `x-edgekv-generation` |
 | `GET /snapshot` | Current snapshot | `{ "generation", "snapshot_lsn", "parts": [{ "url", "size", "checksum" }] }` |
 | `GET {part url}` | One snapshot part | Binary: one [snapshot part](format.md#snapshot-part) |
 | `GET /kv/{key}` | One value, for `fetch` | The value, with its version in `x-edgekv-version`; `404` `KEY_NOT_FOUND` if there is none |
@@ -123,6 +126,15 @@ its pushes carry as `replica_id`. Together with `after`, it tells the service ho
 each replica has read, so it can show which replicas follow a database and how far
 behind each is. The header is optional to a service that speaks this protocol; a
 request without it is answered the same way.
+
+**Waiting for changes.** A replica that is up to date asks with `wait_ms`, by
+default 25,000 (`Options::follow_wait`). A service that supports it holds the
+request until a frame after `after` exists, then answers with it, or answers with no
+frames when the wait runs out. Either way it sets `x-edgekv-waited` on the response,
+and the replica asks again at once. A response without that header was not held:
+the replica then waits `pull_interval` before asking again, so a service that does
+not hold requests, or will not hold any more on that database, is polled as before.
+A service may hold a request for less than `wait_ms`.
 
 **Commit**
 

@@ -22,6 +22,9 @@ const ERROR_CODE_HEADER: &str = "x-edgekv-error";
 const REPLICA_HEADER: &str = "x-edgekv-replica";
 /// Header carrying the version of a value read.
 const VERSION_HEADER: &str = "x-edgekv-version";
+/// Header with which the service says it held a `GET /log` that asked to
+/// wait. Without it, the service answered at once, and the replica polls.
+const WAITED_HEADER: &str = "x-edgekv-waited";
 /// How long a download (log page or snapshot part) may take.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// A token is replaced this long before it expires, so a request never
@@ -52,10 +55,13 @@ fn token_expiry_ms(token: &str) -> Option<u64> {
 }
 
 /// What `GET /log` answered.
-enum LogPage {
+pub(crate) enum LogPage {
     Frames {
         generation: u64,
         frames: Vec<Frame>,
+        /// The service held the request until there was something new, or
+        /// until the wait asked for ran out.
+        waited: bool,
     },
     /// The frames asked for exist only inside the current snapshot.
     SnapshotRequired,
@@ -440,14 +446,25 @@ impl Client {
             .ok_or_else(|| Error::corrupt("head response has no lsn"))
     }
 
-    async fn log(&self, after: Lsn) -> Result<LogPage> {
+    /// The frames after `after`. With `wait`, the service may hold the
+    /// request until there are some, for at most that long.
+    pub(crate) async fn log(&self, after: Lsn, wait: Option<Duration>) -> Result<LogPage> {
         // `after` is how far this replica has read: with the replica header,
         // the service knows how far behind it is.
+        let url = match wait {
+            Some(wait) => format!(
+                "{}/log?after={after}&wait_ms={}",
+                self.base,
+                wait.as_millis()
+            ),
+            None => format!("{}/log?after={after}", self.base),
+        };
         let request = self
             .http
-            .get(format!("{}/log?after={after}", self.base))
+            .get(url)
             .header(REPLICA_HEADER, self.replica.to_string());
-        let response = match self.send(request, DOWNLOAD_TIMEOUT).await {
+        let timeout = DOWNLOAD_TIMEOUT + wait.unwrap_or_default();
+        let response = match self.send(request, timeout).await {
             Ok(response) => response,
             Err(Error::Service {
                 code: "SNAPSHOT_REQUIRED",
@@ -461,6 +478,7 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        let waited = response.headers().contains_key(WAITED_HEADER);
         let bytes = response
             .bytes()
             .await
@@ -470,6 +488,7 @@ impl Client {
         Ok(LogPage::Frames {
             generation,
             frames: segment.frames,
+            waited,
         })
     }
 
@@ -534,30 +553,43 @@ impl Client {
         }
         loop {
             let applied = state.position()?.applied_lsn;
-            match self.log(applied).await? {
+            match self.log(applied, None).await? {
                 LogPage::SnapshotRequired => self.bootstrap(state).await?,
                 LogPage::Frames { frames, .. } if frames.is_empty() => return Ok(applied),
-                LogPage::Frames { generation, frames } => {
-                    if frames[0].lsn != applied + 1 {
-                        return Err(Error::corrupt(format!(
-                            "the service sent frames starting at {} but the local copy is at {applied}",
-                            frames[0].lsn
-                        )));
-                    }
-                    let last = frames.last().map(|f| f.lsn).unwrap_or(applied);
-                    // Applying frames and recording the position is one
-                    // atomic local write, so a crash here loses nothing.
-                    state.apply(
-                        &frames,
-                        ChainPos {
-                            generation,
-                            next_seq: 0,
-                            prev_checksum: 0,
-                            applied_lsn: last,
-                        },
-                    )?;
-                }
+                LogPage::Frames {
+                    generation, frames, ..
+                } => apply_frames(state, applied, generation, &frames)?,
             }
         }
     }
+}
+
+/// Applies frames read after `applied` to the local copy.
+pub(crate) fn apply_frames(
+    state: &LocalStore,
+    applied: Lsn,
+    generation: u64,
+    frames: &[Frame],
+) -> Result<()> {
+    let Some(first) = frames.first() else {
+        return Ok(());
+    };
+    if first.lsn != applied + 1 {
+        return Err(Error::corrupt(format!(
+            "the service sent frames starting at {} but the local copy is at {applied}",
+            first.lsn
+        )));
+    }
+    let last = frames.last().map(|f| f.lsn).unwrap_or(applied);
+    // Applying frames and recording the position is one atomic local
+    // write, so a crash here loses nothing.
+    state.apply(
+        frames,
+        ChainPos {
+            generation,
+            next_seq: 0,
+            prev_checksum: 0,
+            applied_lsn: last,
+        },
+    )
 }

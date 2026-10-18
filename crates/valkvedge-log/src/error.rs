@@ -18,7 +18,7 @@ pub enum RejectReason {
 ///
 /// [`Error::code`] returns a stable, machine-readable code. The message is for
 /// humans and may change.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     /// The object store returned an error or could not be reached.
     #[error("object store unavailable: {0}")]

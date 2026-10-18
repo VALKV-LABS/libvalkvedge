@@ -148,6 +148,12 @@ Two properties to notice:
 
 - **A sync write touches local state only after the object store has it.** A failed
   sync write leaves nothing to undo.
+- **Sync writes made together share one object.** While one segment is being written,
+  commits that arrive wait, and the next segment carries all of them, one frame (and
+  one LSN) each. Conditions are checked in order, against the commits before them in
+  the same segment. A commit alone is written at once, so this adds no delay; under
+  load it cuts object-store writes. `ValkvEdge::commits_and_segments` reports both
+  counts.
 - **A buffered write needs no network at all.** It does not even take the lease. The
   lease is taken when the outbox is pushed.
 
@@ -299,10 +305,11 @@ is replaced is the bottom of the stack: instead of `valkvedge-sync` and `valkved
 reading and writing the object store, a small HTTP client
 ([`remote.rs`](../crates/valkvedge/src/remote.rs)) sends sync writes and outbox entries
 to the service and asks it for frames and snapshots. The frames and snapshot parts it
-receives are in the same formats, checked the same way. See
-[hosted-api.md](hosted-api.md).
+receives are in the same formats, checked the same way. An open database is
+followed by a background task that asks the service for what comes next and is
+answered as soon as it exists, so changes arrive as they happen rather than at the
+next poll. See [hosted-api.md](hosted-api.md).
 
 ## Not here yet
 
-- Group commit: each sync write is currently one object.
 - Bulk loading of snapshots through Fjall's ingestion API.

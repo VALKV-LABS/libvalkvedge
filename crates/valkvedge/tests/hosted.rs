@@ -19,7 +19,7 @@ use base64::Engine;
 use object_store::memory::InMemory;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use valkvedge::{
@@ -46,6 +46,11 @@ struct Server {
     expired: std::sync::Mutex<Vec<String>>,
     /// The credential presented on each request.
     presented: std::sync::Mutex<Vec<String>>,
+    /// Holds a `GET /log` that asks to wait, as the service does. Off, the
+    /// server answers at once, as one that does not hold requests would.
+    hold_log: AtomicBool,
+    /// How many `GET /log` requests asked to wait.
+    waits_asked: AtomicUsize,
 }
 
 type Shared = State<Arc<Server>>;
@@ -281,34 +286,55 @@ async fn log(
             .push((replica.to_string(), after));
     }
     let layout = Layout::new(db.object_prefix().unwrap());
-    let mut frames = Vec::new();
-    let mut generation = 0;
-    if let Some((manifest, _)) = read_manifest(&server.store, &layout).await.unwrap() {
-        if after < manifest.snapshot_lsn {
-            return error(
-                StatusCode::CONFLICT,
-                "SNAPSHOT_REQUIRED",
-                "use the snapshot",
-            );
-        }
-        generation = manifest.generation;
-        frames = read_segments(&server.store, &layout, generation, 0, 0, usize::MAX)
-            .await
-            .unwrap()
-            .into_iter()
-            .flat_map(|s| s.segment.frames)
-            .filter(|f| f.lsn > after)
-            // Small pages, so the client's paging loop is exercised.
-            .take(3)
-            .collect();
+    let wait = query
+        .get("wait_ms")
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis);
+    if wait.is_some() {
+        server.waits_asked.fetch_add(1, Ordering::SeqCst);
     }
-    let (bytes, _) = Segment::new(0, frames).encode();
-    let mut response = Bytes::from(bytes).into_response();
-    response.headers_mut().insert(
-        "x-edgekv-generation",
-        generation.to_string().parse().unwrap(),
-    );
-    response
+    let hold = wait.filter(|_| server.hold_log.load(Ordering::SeqCst));
+    let deadline = Instant::now() + hold.unwrap_or_default();
+    loop {
+        let mut frames = Vec::new();
+        let mut generation = 0;
+        if let Some((manifest, _)) = read_manifest(&server.store, &layout).await.unwrap() {
+            if after < manifest.snapshot_lsn {
+                return error(
+                    StatusCode::CONFLICT,
+                    "SNAPSHOT_REQUIRED",
+                    "use the snapshot",
+                );
+            }
+            generation = manifest.generation;
+            frames = read_segments(&server.store, &layout, generation, 0, 0, usize::MAX)
+                .await
+                .unwrap()
+                .into_iter()
+                .flat_map(|s| s.segment.frames)
+                .filter(|f| f.lsn > after)
+                // Small pages, so the client's paging loop is exercised.
+                .take(3)
+                .collect();
+        }
+        // Held: nothing new yet, and time left to wait for it.
+        if frames.is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
+        }
+        let (bytes, _) = Segment::new(0, frames).encode();
+        let mut response = Bytes::from(bytes).into_response();
+        response.headers_mut().insert(
+            "x-edgekv-generation",
+            generation.to_string().parse().unwrap(),
+        );
+        if hold.is_some() {
+            response
+                .headers_mut()
+                .insert("x-edgekv-waited", "1".parse().unwrap());
+        }
+        return response;
+    }
 }
 
 async fn snapshot(
@@ -459,6 +485,8 @@ async fn service(dir: &tempfile::TempDir) -> Service {
         tokens: std::sync::Mutex::new(Vec::new()),
         expired: std::sync::Mutex::new(Vec::new()),
         presented: std::sync::Mutex::new(Vec::new()),
+        hold_log: AtomicBool::new(true),
+        waits_asked: AtomicUsize::new(0),
     });
     let app = Router::new()
         .route("/v1/db/{db}/commit", post(commit))
@@ -1318,4 +1346,120 @@ async fn fetch_reads_the_newest_value_from_the_service_and_opens_sealed_values()
         follower.fetch(&[0xff, 0x00]).await.unwrap_err().code(),
         "UNSUPPORTED"
     );
+}
+
+// --- Following: changes reach an open replica as they happen ----------------
+
+/// A client whose open databases follow the service in the background, and
+/// poll every `poll` only when the service does not hold their requests.
+fn following(dir: &tempfile::TempDir, service: &Service, options: Options) -> ValkvEdge {
+    ValkvEdge::builder(dir.path())
+        .options(Options {
+            background: true,
+            follow_wait: Duration::from_secs(5),
+            ..options
+        })
+        .remote(&service.url, API_KEY)
+        .build()
+        .unwrap()
+}
+
+/// Waits until `key` reads `value`, failing after `within`.
+async fn arrives(db: &Database, key: &[u8], value: &str, within: Duration) {
+    let started = Instant::now();
+    while text(db.get(key).unwrap()).as_deref() != Some(value) {
+        assert!(
+            started.elapsed() < within,
+            "{value} did not arrive within {within:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_replica_is_told_of_a_write_at_once_not_at_its_next_poll() {
+    let [sdir, adir, bdir] = dirs();
+    let service = service(&sdir).await;
+    let writer = replica(&adir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    writer.put(b"k", b"before").await.unwrap();
+
+    // b would poll once a minute: a write that reaches it sooner was pushed.
+    let poll_once_a_minute = Options {
+        pull_interval: Duration::from_secs(60),
+        ..fast()
+    };
+    let b = following(&bdir, &service, poll_once_a_minute)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(text(b.get(b"k").unwrap()).as_deref(), Some("before"));
+    for i in 0..3 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let value = format!("v{i}");
+        writer.put(b"k", value.as_bytes()).await.unwrap();
+        arrives(&b, b"k", &value, Duration::from_secs(3)).await;
+    }
+    assert!(service.server.waits_asked.load(Ordering::SeqCst) >= 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn against_a_service_that_does_not_hold_requests_a_replica_polls_at_its_interval() {
+    let [sdir, adir, bdir] = dirs();
+    let service = service(&sdir).await;
+    service.server.hold_log.store(false, Ordering::SeqCst);
+    let writer = replica(&adir, &service, API_KEY)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+    writer.put(b"k", b"1").await.unwrap();
+    let every_300_ms = Options {
+        pull_interval: Duration::from_millis(300),
+        ..fast()
+    };
+    let b = following(&bdir, &service, every_300_ms)
+        .database("app")
+        .open()
+        .await
+        .unwrap();
+
+    // Answered at once, it asks again after its interval, not in a tight loop.
+    let before = service.server.waits_asked.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let asked = service.server.waits_asked.load(Ordering::SeqCst) - before;
+    assert!(asked <= 6, "asked {asked} times in one second");
+
+    writer.put(b"k", b"2").await.unwrap();
+    arrives(&b, b"k", "2", Duration::from_secs(3)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_followed_database_still_closes_when_nobody_uses_it() {
+    let [sdir, bdir] = dirs();
+    let service = service(&sdir).await;
+    let close_soon = Options {
+        pull_interval: Duration::from_millis(100),
+        idle_close_after: Duration::from_millis(300),
+        ..fast()
+    };
+    let kv = following(&bdir, &service, close_soon);
+    let db = kv.database("app").open().await.unwrap();
+    db.put(b"k", b"v").await.unwrap();
+    drop(db);
+
+    // Its follower is waiting on the service meanwhile; that must not keep
+    // the database open.
+    let started = Instant::now();
+    while kv.open_databases() > 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the database stayed open"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
