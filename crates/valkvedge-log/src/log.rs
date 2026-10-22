@@ -591,6 +591,7 @@ mod tests {
                     counter: 0,
                     replica: ReplicaId([1; 16]),
                 },
+                expires_ms: None,
             }],
         }
     }
@@ -731,6 +732,7 @@ mod tests {
                 value: b"v".to_vec(),
                 hlc: Hlc::default(),
                 tombstone: false,
+                expires_ms: None,
             })
             .await
             .unwrap();

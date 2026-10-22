@@ -36,6 +36,9 @@ conditional writes rather than a lock service.
   changes and writes back with retries. Counters and stock levels lose no updates.
 - **Change subscriptions.** `Database::watch(prefix)` reports every change under a
   prefix as it reaches the local copy, whoever made it, so a UI can follow the data.
+- **Values that expire.** `put_with_ttl(key, value, ttl)` stores a value that every copy
+  reads as absent once its time has passed. The writer then deletes it, so replicas and
+  watchers see it go.
 
 ## Quick start
 

@@ -190,6 +190,7 @@ async fn a_buffered_write_is_reported_at_once_and_again_only_if_it_loses() {
             counter: 0,
             replica: other,
         },
+        expires_ms: None,
     };
     db.accept_push(
         other,

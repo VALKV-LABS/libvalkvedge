@@ -47,6 +47,7 @@ fn put(key: &str, value: &str) -> Change {
         kind: OpKind::Put,
         key: key.as_bytes().to_vec(),
         value: value.as_bytes().to_vec(),
+        expires_ms: None,
     }
 }
 
@@ -55,6 +56,7 @@ fn del(key: &str) -> Change {
         kind: OpKind::Delete,
         key: key.as_bytes().to_vec(),
         value: vec![],
+        expires_ms: None,
     }
 }
 

@@ -1,4 +1,4 @@
-# Object format, version 1
+# Object format, version 2
 
 Everything a database keeps in the object store. Implemented in
 [`valkvedge-log`](../crates/valkvedge-log/src/format.rs); the tests there are the
@@ -35,10 +35,14 @@ Compared field by field in that order.
 
 | Field | Type |
 |---|---|
-| `kind` | `u8`: 0 put, 1 delete |
+| `kind` | `u8`: 0 put, 1 delete, 2 put of a value that expires (version 2) |
 | `key` | byte string |
 | `value` | byte string (empty for a delete; ciphertext if the database is encrypted) |
 | `hlc` | timestamp |
+| `expires_ms` | `u64`, milliseconds since the Unix epoch. Kind 2 only |
+
+A value that has expired reads as absent. The writer then deletes it with an ordinary
+kind 1 operation.
 
 ## Frame
 
@@ -98,6 +102,8 @@ Records:
 
 - tag `0`, an entry: `tombstone` `u8`, timestamp, `key` byte string, `value` byte string.
   Entries appear in ascending key order across the parts.
+- tag `2`, an entry whose value expires (version 2): the same fields as tag `0`, then
+  `expires_ms` `u64`.
 - tag `1`, a replica watermark: `replica` (16 bytes), `seq` `u64`: the highest outbox
   sequence number applied for that replica.
 
@@ -157,3 +163,13 @@ own clock. Timestamps from different machines are never compared.
 Every binary object carries a version after its magic, and the manifest carries
 `format_version`. A reader that meets a version higher than it supports must refuse to
 open the database.
+
+| Version | Adds |
+|---|---|
+| 1 | Everything above except what version 2 adds |
+| 2 | Values that expire: operation kind 2, snapshot record tag 2 |
+
+A writer writes the lowest version an object needs: a segment or snapshot part is
+version 2 only if it holds a value that expires, and the manifest stays at 1. A database
+that never uses expiry stays readable by builds that know only version 1. A build that
+knows only version 1 refuses a version 2 object rather than misreading it.

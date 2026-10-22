@@ -197,8 +197,12 @@ A service may hold a request for less than `wait_ms`.
 ] }
 ```
 
+A put may carry `"expires_at": "2026-10-18T09:30:00.250Z"`: its value expires then (see
+[components](components.md#values-that-expire)). The same field may appear on a pushed
+put.
+
 `conditions` is optional. Each names a key and the version its value must be at, or
-`null` for "has no value". If any does not hold, nothing is written and the service
+`null` for "has no value". A value that has expired counts as no value. If any does not hold, nothing is written and the service
 answers `412` with code `CONDITION_FAILED` and the key, base64-encoded, in
 `error.key`. `versions` in the response has one entry per operation: the version that
 write gave its key. A version is 56 hex characters, the

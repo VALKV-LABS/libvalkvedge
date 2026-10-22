@@ -73,7 +73,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use valkvedge_log::{Frame, HlcClock, Layout, Node, Store};
 use valkvedge_sync::{Change, CommitCounters, Condition, StateStore, Writer};
 
@@ -378,7 +378,8 @@ impl Builder {
         });
         if inner.options.background {
             let tick = match &inner.backend {
-                Backend::Local => None,
+                // Only to delete expired values.
+                Backend::Local => Some(inner.options.push_interval),
                 Backend::Object {
                     role: Role::Writer, ..
                 } => Some(inner.options.push_interval),
@@ -615,6 +616,12 @@ impl Inner {
                 durability: Durability::Sync,
                 touch: false,
             };
+            // The writer deletes what has expired.
+            if !self.is_remote() && self.role() != Some(Role::Replica) && shared.is_open() {
+                if let Err(e) = db.expire_if_writing().await {
+                    tracing::warn!(database = %shared.name, error = %e, "could not delete expired values");
+                }
+            }
             let result = match self.role() {
                 Some(Role::Writer) if shared.has_outbox.load(Ordering::Relaxed) => {
                     db.flush().await.map(|_| ())
@@ -1192,6 +1199,9 @@ pub enum WriteOutcome {
 }
 
 const MAX_EVENTS: usize = 1024;
+
+/// Expired values deleted in one commit.
+const EXPIRE_BATCH: usize = 1000;
 /// Batches of changes a watcher may fall behind by before it is told to
 /// reload ([`WatchEvent::Reset`]).
 const WATCH_BUFFER: usize = 1024;
@@ -1490,6 +1500,99 @@ impl Database {
         let mut batch = self.batch();
         batch.put(key, value);
         batch.commit().await
+    }
+
+    /// Stores a value that expires `ttl` from now, with this handle's
+    /// default durability.
+    ///
+    /// Once it has expired, every copy reads the key as absent, by its own
+    /// clock, and the database's writer deletes it with an ordinary delete
+    /// that replicas and change feeds see. Writing the key again replaces the
+    /// expiry: a plain [`Database::put`] keeps the value for good. The expiry
+    /// time is stored beside the value, not encrypted with it.
+    pub async fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl: Duration) -> Result<Commit> {
+        let mut batch = self.batch();
+        batch.put_with_ttl(key, value, ttl);
+        batch.commit().await
+    }
+
+    /// When the value of `key` expires, from the local store: `None` when it
+    /// never does, or the key has no value.
+    pub fn expires_at(&self, key: &[u8]) -> Result<Option<SystemTime>> {
+        self.local_reads()?;
+        self.held(key)?;
+        let open = self.open()?;
+        Ok(open
+            .store
+            .get_live(key)?
+            .and_then(|live| live.expires_ms)
+            .map(|ms| UNIX_EPOCH + Duration::from_millis(ms)))
+    }
+
+    /// Deletes values that have expired, now, as the writer, and returns
+    /// how many. The library also does this on its own every few seconds
+    /// for databases this process writes; a replica or a hosted copy leaves
+    /// it to the writer and returns 0.
+    pub async fn expire(&self) -> Result<usize> {
+        let open = self.open()?;
+        let session = self.session_within_limit(&open).await?;
+        self.expire_with(&open, &session).await
+    }
+
+    async fn expire_with(&self, open: &Arc<Open>, session: &Arc<Session>) -> Result<usize> {
+        let now = valkvedge_log::now_ms();
+        match session.as_ref() {
+            Session::Writer(writer) => match writer.expire(now, EXPIRE_BATCH).await {
+                Ok(n) => Ok(n),
+                Err(e @ ValkvEdgeError::ConditionFailed { .. }) => Err(e),
+                Err(e) => {
+                    self.reset_session(open, session).await;
+                    Err(e)
+                }
+            },
+            Session::Local => {
+                let keys = open.store.expired(now, EXPIRE_BATCH)?;
+                let mut deleted = 0;
+                for key in keys {
+                    let delete = Change {
+                        kind: OpKind::Delete,
+                        key: key.clone(),
+                        value: Vec::new(),
+                        expires_ms: None,
+                    };
+                    let unchanged = Condition { key, version: None };
+                    match open
+                        .store
+                        .apply_local(vec![delete], &[unchanged], || open.clock.now())
+                    {
+                        Ok(_) => deleted += 1,
+                        Err(ValkvEdgeError::ConditionFailed { .. }) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(deleted)
+            }
+            Session::Remote(_) | Session::Replica => Ok(0),
+        }
+    }
+
+    /// [`Database::expire`] for a database that already has its writer here,
+    /// run by the background tick. It never opens a session: a database
+    /// another process writes is left to that process.
+    async fn expire_if_writing(&self) -> Result<usize> {
+        let Some(open) = self.shared.current() else {
+            return Ok(0);
+        };
+        // With no object store the local store is the database, and this
+        // process its only writer.
+        if self.kv.role().is_none() {
+            return self.expire_with(&open, &Arc::new(Session::Local)).await;
+        }
+        let session = open.session.lock().await.clone();
+        match session {
+            Some(session) => self.expire_with(&open, &session).await,
+            None => Ok(0),
+        }
     }
 
     /// Removes a key, with this handle's default durability.
@@ -1916,6 +2019,7 @@ impl Database {
                 let ops: Vec<Op> = changes
                     .into_iter()
                     .map(|c| Op {
+                        expires_ms: c.expires_ms.filter(|_| c.kind == OpKind::Put),
                         kind: c.kind,
                         key: c.key,
                         value: c.value,
@@ -2362,6 +2466,29 @@ impl Batch {
             kind: OpKind::Put,
             key: key.to_vec(),
             value: value.to_vec(),
+            expires_ms: None,
+        });
+        self
+    }
+
+    /// Adds a put whose value expires `ttl` from now. See
+    /// [`Database::put_with_ttl`].
+    pub fn put_with_ttl(&mut self, key: &[u8], value: &[u8], ttl: Duration) -> &mut Self {
+        self.put_expiring(key, value, SystemTime::now() + ttl)
+    }
+
+    /// Adds a put whose value expires at `at`. A time already past stores a
+    /// value that reads as absent at once.
+    pub fn put_expiring(&mut self, key: &[u8], value: &[u8], at: SystemTime) -> &mut Self {
+        let ms = at
+            .duration_since(UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        self.changes.push(Change {
+            kind: OpKind::Put,
+            key: key.to_vec(),
+            value: value.to_vec(),
+            expires_ms: Some(ms),
         });
         self
     }
@@ -2372,6 +2499,7 @@ impl Batch {
             kind: OpKind::Delete,
             key: key.to_vec(),
             value: Vec::new(),
+            expires_ms: None,
         });
         self
     }
