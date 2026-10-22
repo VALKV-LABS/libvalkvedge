@@ -23,7 +23,7 @@ pub mod store;
 pub mod types;
 
 pub use error::{Error, RejectReason, Result};
-pub use format::{Layout, Manifest, PartRef, Record, Segment, FORMAT_VERSION};
+pub use format::{KeySlot, Layout, Manifest, PartRef, Record, Segment, FORMAT_VERSION};
 pub use lease::{Lease, LeaseConfig, LeaseRecord, LeaseState, Node};
 pub use log::{
     read_manifest, read_segments, read_snapshot_part, ChainPos, LogWriter, ReadSegment,

@@ -163,6 +163,51 @@ fn kind(value: &Value) -> OpKind {
     }
 }
 
+/// The database's key slots, kept for clients that encrypt their own values.
+async fn keys_get(
+    State(server): Shared,
+    Path(database): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let db = match server.open(&headers, &database, false).await {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    let slots = match db.stored_key_slots().await {
+        Ok(slots) => slots,
+        Err(e) => return library_error(e),
+    };
+    let lsn = db.status().map(|s| s.applied_lsn).unwrap_or(0);
+    Json(json!({ "slots": slots, "lsn": lsn })).into_response()
+}
+
+async fn keys_put(
+    State(server): Shared,
+    Path(database): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let db = match server.open(&headers, &database, true).await {
+        Ok(db) => db,
+        Err(response) => return response,
+    };
+    let slots = |field: &str| -> Vec<valkvedge::KeySlot> {
+        serde_json::from_value(body[field].clone()).unwrap_or_default()
+    };
+    match db
+        .replace_stored_key_slots(&slots("expected"), slots("slots"))
+        .await
+    {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(valkvedge::ValkvEdgeError::ConditionFailed { .. }) => error(
+            StatusCode::PRECONDITION_FAILED,
+            "CONDITION_FAILED",
+            "the key slots changed",
+        ),
+        Err(e) => library_error(e),
+    }
+}
+
 /// An operation's `expires_at`, in milliseconds since the Unix epoch.
 fn expires(op: &Value) -> Option<u64> {
     op["expires_at"].as_str().and_then(parse_rfc3339)
@@ -648,6 +693,7 @@ async fn service(dir: &tempfile::TempDir) -> Service {
         .route("/v1/db/{db}/snapshot/parts/{part}", get(snapshot_part))
         .route("/v1/db/{db}/history", get(history))
         .route("/v1/db/{db}/restore", post(restore))
+        .route("/v1/db/{db}/keys", get(keys_get).put(keys_put))
         .route("/v1/db/{db}/kv", get(kv_scan))
         .route("/v1/db/{db}/kv/{*key}", get(kv_get))
         .with_state(server.clone());
@@ -977,13 +1023,84 @@ async fn with_a_key_the_service_only_ever_sees_ciphertext() {
         Some("PLAINTEXT-737")
     );
 
-    let c = replica(&cdir, &service, API_KEY)
+    // A key that is not one of the database's opens nothing.
+    let wrong = replica(&cdir, &service, API_KEY)
         .database("vault")
         .encryption_key([6u8; 32])
         .open()
+        .await;
+    assert_eq!(
+        wrong.err().map(|e| e.code().to_string()).as_deref(),
+        Some("INVALID_ENCRYPTION_KEY")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_encrypted_database_gets_a_recovery_key_that_opens_it_elsewhere() {
+    let [sdir, adir, bdir] = dirs();
+    let service = service(&sdir).await;
+    let a = replica(&adir, &service, API_KEY)
+        .database("vault")
+        .encryption_key([5u8; 32])
+        .open()
         .await
         .unwrap();
-    assert_eq!(c.get(b"pin").unwrap_err().code(), "INVALID_ENCRYPTION_KEY");
+    let recovery = a.take_recovery_key().expect("a new database has one");
+    assert_eq!(a.take_recovery_key(), None, "given out once");
+    a.put(b"pin", b"1234").await.unwrap();
+    assert_eq!(a.key_ids().await.unwrap().len(), 2);
+
+    // The service keeps the slots, never a key.
+    let on_service = service.server.kv.database("vault").open().await.unwrap();
+    let slots = on_service.stored_key_slots().await.unwrap();
+    assert_eq!(slots.len(), 2);
+    assert!(!slots.iter().any(|s| s.wrapped.contains(&recovery)));
+
+    // Another copy opens with the recovery key alone.
+    let b = replica(&bdir, &service, API_KEY)
+        .database("vault")
+        .encryption_key(valkvedge::key_from_hex(&recovery).unwrap())
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(text(b.get(b"pin").unwrap()).as_deref(), Some("1234"));
+    assert_eq!(b.take_recovery_key(), None, "it did not make the database");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_database_encrypted_before_key_slots_opens_with_its_key_and_can_be_given_more() {
+    let [sdir, adir, bdir, cdir] = dirs();
+    let service = service(&sdir).await;
+    // Already holds data, and no slots: as a database encrypted with one key
+    // before key slots existed. Its key is its data key.
+    let plain = replica(&adir, &service, API_KEY)
+        .database("old")
+        .open()
+        .await
+        .unwrap();
+    plain.put(b"first", b"x").await.unwrap();
+    drop(plain);
+    let key = [7u8; 32];
+    let a = replica(&bdir, &service, API_KEY)
+        .database("old")
+        .encryption_key(key)
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(a.take_recovery_key(), None);
+    a.put(b"pin", b"1234").await.unwrap();
+    assert_eq!(a.key_ids().await.unwrap(), vec![valkvedge::key_id(&key)]);
+
+    // Given a recovery key: the key gets the first slot, the new one the second.
+    let recovery = a.add_recovery_key().await.unwrap();
+    assert_eq!(a.key_ids().await.unwrap().len(), 2);
+    let b = replica(&cdir, &service, API_KEY)
+        .database("old")
+        .encryption_key(valkvedge::key_from_hex(&recovery).unwrap())
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(text(b.get(b"pin").unwrap()).as_deref(), Some("1234"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

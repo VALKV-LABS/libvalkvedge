@@ -11,7 +11,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use valkvedge_log::types::{decode_ops, encode_ops, Dec};
 use valkvedge_log::{
-    has_expired, now_ms, ChainPos, Error, Frame, Hlc, Lsn, Op, OpKind, Record, ReplicaId, Result,
+    has_expired, now_ms, ChainPos, Error, Frame, Hlc, KeySlot, Lsn, Op, OpKind, Record, ReplicaId,
+    Result,
 };
 use valkvedge_sync::{Change, Condition, OutboxEntry, StateStore};
 
@@ -34,6 +35,7 @@ const RESETTING: &[u8] = b"resetting";
 const REPLICA_ID: &[u8] = b"device";
 const OUTBOX_STAT: &[u8] = b"outbox";
 const ENC_CHECK: &[u8] = b"enc";
+const KEY_SLOTS: &[u8] = b"keyslots";
 const PREFIXES: &[u8] = b"prefixes";
 
 fn local(e: fjall::Error) -> Error {
@@ -259,6 +261,21 @@ impl LocalStore {
 
     pub(crate) fn set_encryption_check(&self, check: &str) -> Result<()> {
         self.meta.insert(ENC_CHECK, check.as_bytes()).map_err(local)
+    }
+
+    /// The database's key slots as this copy last saw them, so it opens with
+    /// any of its keys offline. For a database with no other copy, the only
+    /// record of them.
+    pub(crate) fn key_slots(&self) -> Result<Vec<KeySlot>> {
+        match self.meta_get(KEY_SLOTS)? {
+            None => Ok(Vec::new()),
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| Error::corrupt("key slots")),
+        }
+    }
+
+    pub(crate) fn set_key_slots(&self, slots: &[KeySlot]) -> Result<()> {
+        let bytes = serde_json::to_vec(slots).expect("key slots serialize");
+        self.meta.insert(KEY_SLOTS, bytes).map_err(local)
     }
 
     pub(crate) fn outbox_stat(&self) -> Result<OutboxStat> {

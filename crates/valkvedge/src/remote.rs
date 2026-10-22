@@ -5,14 +5,15 @@
 
 use crate::local::LocalStore;
 use crate::prefixes::Prefixes;
-use crate::{Auth, History, Point, Restored, Version};
+use crate::{Auth, History, KeyState, Point, Restored, Version};
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
 use base64::Engine;
 use serde_json::{json, Value};
 use std::time::Duration;
 use valkvedge_log::format::decode_snapshot_part;
 use valkvedge_log::{
-    now_ms, ChainPos, Error, Frame, Hlc, Lsn, OpKind, RejectReason, ReplicaId, Result, Segment,
+    now_ms, ChainPos, Error, Frame, Hlc, KeySlot, Lsn, OpKind, RejectReason, ReplicaId, Result,
+    Segment,
 };
 use valkvedge_sync::{Change, Condition, OpOutcome, OutboxEntry, PushReport, StateStore};
 
@@ -323,6 +324,36 @@ impl Client {
             stamps.push(version.hlc());
         }
         Ok((lsn, stamps))
+    }
+
+    /// The database's key slots as the service keeps them, and whether it
+    /// holds anything yet. The service keeps no encryption marker.
+    pub(crate) async fn key_state(&self) -> Result<KeyState> {
+        let request = self.http.get(format!("{}/keys", self.base));
+        // The first request for a database: the service may be opening it.
+        let reply = self.json(request, DOWNLOAD_TIMEOUT).await?;
+        let slots: Vec<KeySlot> = serde_json::from_value(reply["slots"].clone())
+            .map_err(|_| Error::corrupt("the service's key slots are malformed"))?;
+        Ok(KeyState {
+            slots,
+            check: None,
+            empty: reply["lsn"].as_u64().unwrap_or(0) == 0,
+        })
+    }
+
+    /// Replaces the database's key slots at the service, if they are still
+    /// `expected`; otherwise `CONDITION_FAILED`.
+    pub(crate) async fn put_key_slots(
+        &self,
+        expected: &[KeySlot],
+        slots: &[KeySlot],
+    ) -> Result<()> {
+        let request = self
+            .http
+            .put(format!("{}/keys", self.base))
+            .json(&json!({ "expected": expected, "slots": slots }));
+        self.json(request, DOWNLOAD_TIMEOUT).await?;
+        Ok(())
     }
 
     /// Hands outbox entries to the service. Safe to repeat.
