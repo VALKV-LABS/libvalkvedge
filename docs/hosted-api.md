@@ -165,6 +165,8 @@ Every request is `Authorization: Bearer <api key or token>` under `/v1/db/{datab
 | `GET /kv?prefix=&limit=&page_token=` | A page of keys, for `fetch_page` | `{ "items": [{ "key", "value", "version" }], "next_page_token" }`, keys and values base64 |
 | `GET /history` | How far back it can be restored, for `Database::history` | `{ "from_lsn", "from", "to_lsn" }`; `from` is RFC 3339 or `null` |
 | `POST /restore` | Restore to `{ "lsn" }` or `{ "at": "<RFC 3339>" }`, for `Database::restore` | `{ "from_lsn", "lsn" }`; `409` `NOT_IN_HISTORY` outside the history |
+| `GET /keys` | The database's [key slots](format.md#manifestjson), for an encrypted database | `{ "slots": [{ "id", "wrapped" }], "lsn" }` |
+| `PUT /keys` | Replace them: `{ "expected": [...], "slots": [...] }` | `{}`; `412` `CONDITION_FAILED` if they are no longer `expected` |
 
 Keys and values travel base64-encoded in JSON bodies.
 
@@ -278,8 +280,10 @@ message.
   the service may have stored it anyway; make sync writes safe to repeat.
 - **Encryption** works the same way: with `encryption_key`, values are sealed on the
   replica and the service only ever stores ciphertext. Key names are not encrypted. The
-  check that catches a wrong key before any read is kept on the replica only in this
-  mode; a replica opening with the wrong key finds out on its first read.
+  service keeps the database's key slots (`GET /keys`, `PUT /keys`), which reveal
+  nothing without one of the keys, and no encryption marker: a key that opens none of
+  the slots is refused when the database is opened. A database encrypted before key
+  slots has none, and a wrong key shows on the first read.
 - **One replica, one outbox.** The replica id that identifies a replica's pushes is
   stored in its local directory. Copying that directory to another machine makes two
   replicas with the same id; do not do that.

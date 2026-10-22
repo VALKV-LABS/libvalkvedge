@@ -29,8 +29,10 @@ conditional writes rather than a lock service.
   those prefixes, for data shared by a team where each copy holds what it may see.
 - **Many databases per process.** Thousands on disk, a bounded number open. Idle ones are
   closed and reopen on next use without the caller noticing.
-- **Optional encryption.** Values are sealed with a key you supply before they are
-  written anywhere. Keys (the key names) are not encrypted.
+- **Optional encryption.** Values are sealed before they are written anywhere, with a
+  data key that any of the database's keys opens. A new encrypted database also gets a
+  recovery key, given out once; keys can be added and removed without encrypting
+  anything again. Keys (the key names) are not encrypted.
 - **Conditional writes.** Every value has a version. A sync batch can require keys to
   be at a version, or absent, and is written only if they are; `Database::update` reads,
   changes and writes back with retries. Counters and stock levels lose no updates.
@@ -122,9 +124,12 @@ db.sync().await?;                                 // pull what is new, any time
 - **A failed sync write may still have been stored.** If the object store accepts a
   write but the response is lost, the caller gets an error and the write is durable.
   Make sync writes safe to repeat.
-- **Encryption does not hide keys.** Key names, value sizes and timestamps stay
-  readable to anyone who can read the local files or the bucket. If you lose the
-  encryption key, the data cannot be recovered.
+- **Encryption does not hide keys.** Key names, value sizes, timestamps and expiry
+  times stay readable to anyone who can read the local files or the bucket.
+- **Lose every key and the data is gone.** Store the recovery key from
+  `take_recovery_key` where you keep secrets, apart from the key you use. Nobody,
+  including whoever runs the object store or service, can recover the data without one
+  of the database's keys.
 - **One writer process per database.** Other processes are replicas. A second writer is
   refused while the first is alive, and takes over about 30 seconds after it dies, or
   immediately after it calls `close()`.

@@ -119,13 +119,28 @@ Records:
   "superseded": [{ "generation": 2, "at_ms": 1791700000000, "snapshot_lsn": 900,
                    "snapshot_ms": 1791600000000, "snapshot_parts": [] }],
   "encryption_check": "…hex…",
+  "key_slots": [{ "id": "4110f1a6725b07a0", "wrapped": "…hex…" }],
   "snapshot_ms": 1791700000000
 }
 ```
 
 Replaced only by compare-and-swap on its entity tag. `generation` is current;
 `snapshot_lsn` 0 with no parts means the generation starts empty. `encryption_check` is
-present when values are encrypted.
+present when values are encrypted: the constant `valkvedge-encryption-check` sealed with
+the data key, under the key name `\0valkvedge/check`.
+
+`key_slots` hold the database's data key, the key its values are sealed with, once for
+each key that may open it. Absent for an unencrypted database, and for one encrypted
+before key slots existed, whose one key is its data key.
+
+- `id`: hex of the first 8 bytes of the ChaCha20-Poly1305 tag that the key computes over
+  an empty message, with an all-zero nonce and associated data `valkvedge/key-id`. It
+  names the key without revealing it.
+- `wrapped`: hex of a 12-byte random nonce followed by the data key sealed with the key
+  under ChaCha20-Poly1305, with associated data `valkvedge/data-key`, the database
+  name's length (`u32`) and the name.
+
+A reader tries the slot whose `id` matches its key first, and accepts any slot that opens.
 
 `superseded` lists older generations not yet deleted. Each records when it was
 replaced (`at_ms`) and, for the history (see [components](components.md#history)), the

@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, Mutex};
 use valkvedge_log::{
-    now_ms, ChainPos, Error, Frame, Hlc, HlcClock, Layout, LogWriter, Lsn, Manifest, Node, Op,
-    OpKind, Origin, Record, RejectReason, ReplicaId, Result, SnapshotUpload, Store,
+    now_ms, ChainPos, Error, Frame, Hlc, HlcClock, KeySlot, Layout, LogWriter, Lsn, Manifest, Node,
+    Op, OpKind, Origin, Record, RejectReason, ReplicaId, Result, SnapshotUpload, Store,
 };
 
 /// Tunables for a [`Writer`].
@@ -311,6 +311,27 @@ impl<S: StateStore> Writer<S> {
             .as_mut()
             .ok_or(Error::Fenced)?
             .set_encryption_check(check)
+            .await
+    }
+
+    /// The manifest's key slots.
+    pub async fn key_slots(&self) -> Result<Vec<KeySlot>> {
+        let guard = self.log.lock().await;
+        Ok(guard
+            .as_ref()
+            .ok_or(Error::Fenced)?
+            .manifest()
+            .key_slots
+            .clone())
+    }
+
+    /// Replaces the manifest's key slots.
+    pub async fn set_key_slots(&self, slots: Vec<KeySlot>) -> Result<()> {
+        let mut guard = self.log.lock().await;
+        guard
+            .as_mut()
+            .ok_or(Error::Fenced)?
+            .set_key_slots(slots)
             .await
     }
 

@@ -63,7 +63,7 @@ mod prefixes;
 mod remote;
 mod watch;
 
-use crypto::Cipher;
+use crypto::{Cipher, KeyBytes};
 use local::{ChangeFeed, LocalStore};
 use prefixes::Prefixes;
 use std::collections::{HashMap, VecDeque};
@@ -76,16 +76,21 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use valkvedge_log::{Frame, HlcClock, Layout, Node, Store};
 use valkvedge_sync::{Change, CommitCounters, Condition, StateStore, Writer};
+use zeroize::Zeroizing;
 
+pub use crypto::{key_from_hex, key_id, key_to_hex};
 pub use local::Iter;
 pub use prefixes::MAX_PREFIXES;
 pub use valkvedge_log::{Error as ValkvEdgeError, LeaseConfig, Lsn, OpKind, RejectReason, Result};
-pub use valkvedge_log::{Hlc, Op, ReplicaId};
+pub use valkvedge_log::{Hlc, KeySlot, Op, ReplicaId};
 pub use valkvedge_sync::{History, OpOutcome, OutboxEntry, Point, PushReport, WriterConfig};
 
 /// Where scratch stores for rebuilding a past state are made, under the root.
 /// Database names cannot start with a dot.
 const SCRATCH_DIR: &str = ".scratch";
+
+/// Names the database's key slots in a `CONDITION_FAILED` when they changed.
+const KEY_SLOTS_KEY: &[u8] = b"valkvedge/key-slots";
 
 /// What a restore or a branch did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,6 +447,17 @@ struct Shared {
     history: Mutex<Option<Duration>>,
     /// The history's base is being moved forward.
     maintaining: AtomicBool,
+    /// The recovery key made when this process encrypted the database, until
+    /// it is taken ([`Database::take_recovery_key`]).
+    recovery: Mutex<Option<Zeroizing<String>>>,
+}
+
+/// What a database records about its keys: its key slots, its encryption
+/// marker, and whether it holds anything yet.
+struct KeyState {
+    slots: Vec<KeySlot>,
+    check: Option<String>,
+    empty: bool,
 }
 
 struct Open {
@@ -873,7 +889,7 @@ pub struct DatabaseBuilder {
     kv: Arc<Inner>,
     name: String,
     durability: Durability,
-    key: Option<[u8; 32]>,
+    key: Option<Zeroizing<KeyBytes>>,
     ingest: bool,
     prefixes: Option<Vec<Vec<u8>>>,
     history: Option<Duration>,
@@ -932,14 +948,23 @@ impl DatabaseBuilder {
         self
     }
 
-    /// Encrypts values with `key` before they are stored anywhere.
+    /// Encrypts values before they are stored anywhere, and opens the
+    /// database with `key`: one of its keys ([`Database::add_key`]).
     ///
-    /// Keys are not encrypted: their bytes, value sizes and timestamps remain
-    /// visible to anyone who can read the local files or the object store.
-    /// The key is never written to disk. If it is lost, the data cannot be
-    /// recovered.
+    /// Values are sealed with the database's data key, which each of its keys
+    /// opens. A new encrypted database also gets a recovery key, given out
+    /// once by [`Database::take_recovery_key`]: store it somewhere safe. The
+    /// keys themselves are never written anywhere; if every one is lost, the
+    /// data cannot be recovered, by anyone.
+    ///
+    /// Keys (the names) are not encrypted: their bytes, value sizes,
+    /// timestamps and expiry times remain visible to anyone who can read the
+    /// local files or the object store.
+    ///
+    /// The first open of an encrypted database needs the network, unless
+    /// this copy has opened it before.
     pub fn encryption_key(mut self, key: [u8; 32]) -> Self {
-        self.key = Some(key);
+        self.key = Some(Zeroizing::new(key));
         self
     }
 
@@ -973,6 +998,7 @@ impl DatabaseBuilder {
                     prefixes: OnceLock::new(),
                     history: Mutex::new(None),
                     maintaining: AtomicBool::new(false),
+                    recovery: Mutex::new(None),
                 })
             })
             .clone();
@@ -980,16 +1006,11 @@ impl DatabaseBuilder {
             *shared.history.lock().expect("history lock") = Some(history);
         }
 
-        let wanted = self.key.map(|k| Arc::new(Cipher::new(&k, &self.name)));
-        let current = shared.cipher.get_or_init(|| wanted.clone());
-        let same = match (current, &wanted) {
-            (None, None) => true,
-            (Some(a), Some(b)) => a.same_key(b),
-            _ => false,
-        };
-        if !same {
+        // Without a key the database must not be encrypted: settled now. With
+        // one, the data key it opens is found once the local store is open.
+        if self.key.is_none() && shared.cipher.get_or_init(|| None).is_some() {
             return Err(ValkvEdgeError::InvalidEncryptionKey(
-                "this database is already open with a different key".into(),
+                "this database is already open with a key; open it with one of its keys".into(),
             ));
         }
         if self.ingest && !self.kv.is_remote() {
@@ -1044,6 +1065,9 @@ impl DatabaseBuilder {
             touch: true,
         };
         let open = db.open()?;
+        if let Some(key) = &self.key {
+            db.set_cipher(&open, key).await?;
+        }
         let pos = open.store.position()?;
         match db.kv.role() {
             None => {
@@ -1238,6 +1262,362 @@ impl Database {
 
     fn cipher(&self) -> Option<&Arc<Cipher>> {
         self.shared.cipher.get().and_then(Option::as_ref)
+    }
+
+    /// Settles the data key a keyed open uses: the one `key` opens.
+    async fn set_cipher(&self, open: &Arc<Open>, key: &KeyBytes) -> Result<()> {
+        let wanted = match self.shared.cipher.get() {
+            Some(None) => {
+                return Err(ValkvEdgeError::InvalidEncryptionKey(
+                    "this database is already open without a key".into(),
+                ))
+            }
+            // Already open in this process: this key must open the same data key.
+            Some(Some(current)) => {
+                let slots = open.store.key_slots()?;
+                let opens = crypto::key_id(key) == crypto::key_id(current.data_key())
+                    || crypto::unwrap(&slots, key, &self.shared.name)
+                        .is_some_and(|data_key| *data_key == *current.data_key());
+                if !opens {
+                    return Err(ValkvEdgeError::InvalidEncryptionKey(
+                        "this database is already open with a key this one is not".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            None => self.data_cipher(open, key).await?,
+        };
+        let current = self.shared.cipher.get_or_init(|| Some(wanted.clone()));
+        if !current.as_ref().is_some_and(|c| c.same_key(&wanted)) {
+            return Err(ValkvEdgeError::InvalidEncryptionKey(
+                "this database was opened at the same time with another key".into(),
+            ));
+        }
+        // Remember the verified key locally so a wrong key is caught offline too.
+        let check = open.store.encryption_check()?;
+        match check {
+            Some(check) => wanted.verify_check(&check)?,
+            None if open.store.position()?.applied_lsn == 0
+                || !open.store.key_slots()?.is_empty() =>
+            {
+                open.store.set_encryption_check(&wanted.make_check()?)?
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// The cipher for the data key `key` opens. A new, empty database gets a
+    /// data key and two key slots: `key`'s and a recovery key's.
+    async fn data_cipher(&self, open: &Arc<Open>, key: &KeyBytes) -> Result<Arc<Cipher>> {
+        let name = self.shared.name.clone();
+        let cipher = |data_key: &KeyBytes| Arc::new(Cipher::new(data_key, &name));
+        // What this copy already knows opens it offline.
+        let local = open.store.key_slots()?;
+        if let Some(data_key) = crypto::unwrap(&local, key, &name) {
+            return Ok(cipher(&data_key));
+        }
+        let encrypted_here = open.store.encryption_check()?.is_some();
+        for _ in 0..2 {
+            let state = match self.key_state(open).await {
+                Ok(state) => state,
+                // Offline, a copy that has opened this database with its one
+                // key before (it was encrypted before key slots) opens again.
+                Err(e) if local.is_empty() && encrypted_here => {
+                    tracing::debug!(database = %name, error = %e, "the database's keys cannot be read; opening with the key itself");
+                    return Ok(cipher(key));
+                }
+                Err(e) => return Err(e),
+            };
+            if !state.slots.is_empty() {
+                let data_key = crypto::unwrap(&state.slots, key, &name).ok_or_else(|| {
+                    ValkvEdgeError::InvalidEncryptionKey(
+                        "this key is not one of the database's keys".into(),
+                    )
+                })?;
+                let found = cipher(&data_key);
+                if let Some(check) = &state.check {
+                    found.verify_check(check)?;
+                }
+                open.store.set_key_slots(&state.slots)?;
+                return Ok(found);
+            }
+            let fresh = state.empty
+                && state.check.is_none()
+                && !encrypted_here
+                && open.store.position()?.applied_lsn == 0;
+            if !fresh || self.kv.role() == Some(Role::Replica) {
+                // Encrypted before key slots existed: its one key is its data
+                // key. Its marker says whether it is this one.
+                let found = cipher(key);
+                match &state.check {
+                    Some(check) => found.verify_check(check)?,
+                    // Checked against this copy's own marker.
+                    None if encrypted_here => {}
+                    // A hosted service keeps no marker: a wrong key shows when
+                    // a value does not open.
+                    None if self.kv.is_remote() => {}
+                    None => {
+                        return Err(ValkvEdgeError::InvalidEncryptionKey(
+                            "this database already holds unencrypted data".into(),
+                        ))
+                    }
+                }
+                return Ok(found);
+            }
+            match self.create_key_slots(open, key).await {
+                Err(ValkvEdgeError::ConditionFailed { .. }) => continue, // another copy got there first
+                other => return other,
+            }
+        }
+        Err(ValkvEdgeError::Unavailable(
+            "the database's keys kept changing while it was opened".into(),
+        ))
+    }
+
+    /// Gives a new database a random data key, opened by `key` and by a new
+    /// recovery key, which is kept for [`Database::take_recovery_key`].
+    async fn create_key_slots(&self, open: &Arc<Open>, key: &KeyBytes) -> Result<Arc<Cipher>> {
+        let name = &self.shared.name;
+        let data_key = crypto::random_key();
+        let recovery = crypto::random_key();
+        let slots = vec![
+            crypto::wrap(&data_key, key, name)?,
+            crypto::wrap(&data_key, &recovery, name)?,
+        ];
+        let cipher = Arc::new(Cipher::new(&data_key, name));
+        self.store_key_slots(open, &[], slots, Some(cipher.make_check()?))
+            .await?;
+        *self.shared.recovery.lock().expect("recovery lock") =
+            Some(Zeroizing::new(crypto::key_to_hex(&recovery)));
+        Ok(cipher)
+    }
+
+    /// What the database itself records about its keys: in the object store
+    /// or the hosted service, or locally for a database with no other copy.
+    async fn key_state(&self, open: &Arc<Open>) -> Result<KeyState> {
+        if self.kv.is_remote() {
+            let session = self.session_within_limit(open).await?;
+            if let Session::Remote(client) = session.as_ref() {
+                return client.key_state().await;
+            }
+        }
+        match self.kv.role() {
+            None => Ok(KeyState {
+                slots: open.store.key_slots()?,
+                check: open.store.encryption_check()?,
+                empty: open.store.position()?.applied_lsn == 0,
+            }),
+            Some(Role::Writer) => {
+                let session = self.session_within_limit(open).await?;
+                let Session::Writer(writer) = session.as_ref() else {
+                    return Err(ValkvEdgeError::local("a writer's session is not a writer"));
+                };
+                Ok(KeyState {
+                    slots: writer.key_slots().await?,
+                    check: writer.encryption_check().await?,
+                    empty: writer.position().await?.applied_lsn == 0,
+                })
+            }
+            Some(Role::Replica) => {
+                let (store, layout) = self
+                    .kv
+                    .layout(&self.shared.name)
+                    .expect("a replica has an object store");
+                let manifest = valkvedge_log::read_manifest(&store, &layout)
+                    .await?
+                    .ok_or_else(|| ValkvEdgeError::NotFound(self.shared.name.clone()))?
+                    .0;
+                Ok(KeyState {
+                    slots: manifest.key_slots,
+                    check: manifest.encryption_check,
+                    empty: false,
+                })
+            }
+        }
+    }
+
+    /// Replaces the database's key slots, if they are still `expected`
+    /// (otherwise `CONDITION_FAILED`), with `check` as its encryption marker
+    /// when given. A hosted service keeps the slots only.
+    async fn store_key_slots(
+        &self,
+        open: &Arc<Open>,
+        expected: &[KeySlot],
+        slots: Vec<KeySlot>,
+        check: Option<String>,
+    ) -> Result<()> {
+        let changed = || ValkvEdgeError::ConditionFailed {
+            key: KEY_SLOTS_KEY.to_vec(),
+        };
+        let remote_session = if self.kv.is_remote() {
+            Some(self.session_within_limit(open).await?)
+        } else {
+            None
+        };
+        match (remote_session.as_deref(), self.kv.role()) {
+            (Some(Session::Remote(client)), _) => client.put_key_slots(expected, &slots).await?,
+            (_, None) => {
+                if open.store.key_slots()? != expected {
+                    return Err(changed());
+                }
+                open.store.set_key_slots(&slots)?;
+                if let Some(check) = &check {
+                    open.store.set_encryption_check(check)?;
+                }
+            }
+            (_, Some(Role::Writer)) => {
+                let session = self.session_within_limit(open).await?;
+                let Session::Writer(writer) = session.as_ref() else {
+                    return Err(ValkvEdgeError::local("a writer's session is not a writer"));
+                };
+                if writer.key_slots().await? != expected {
+                    return Err(changed());
+                }
+                // Slots first: a marker without them would make the data key
+                // look like the key itself.
+                writer.set_key_slots(slots.clone()).await?;
+                if check.is_some() {
+                    writer.set_encryption_check(check).await?;
+                }
+            }
+            (_, Some(Role::Replica)) => {
+                return Err(ValkvEdgeError::ReadOnly(
+                    "a replica cannot change the database's keys; its writer can".into(),
+                ))
+            }
+        }
+        open.store.set_key_slots(&slots)
+    }
+
+    /// The recovery key made when this process encrypted the database, the
+    /// first time it is asked for; `None` after, or if it did not.
+    ///
+    /// Store it where you keep secrets (a secret manager, or offline): it
+    /// opens the database like any of its keys, and nobody else has it.
+    pub fn take_recovery_key(&self) -> Option<String> {
+        self.shared
+            .recovery
+            .lock()
+            .expect("recovery lock")
+            .take()
+            .map(|key| key.to_string())
+    }
+
+    /// Lets `key` open this database too. Returns its id. Nothing is
+    /// encrypted again: the key gets a copy of the data key, sealed with it.
+    /// The database must be open with one of its keys.
+    pub async fn add_key(&self, key: [u8; 32]) -> Result<String> {
+        let key = Zeroizing::new(key);
+        let cipher = self.keyed()?;
+        let open = self.open()?;
+        let state = self.key_state(&open).await?;
+        let mut slots = state.slots.clone();
+        let id = crypto::key_id(&key);
+        if slots.iter().any(|s| s.id == id) {
+            return Ok(id);
+        }
+        if slots.is_empty() {
+            // Encrypted before key slots: its key is its data key, and gets
+            // the first slot.
+            slots.push(crypto::wrap(
+                cipher.data_key(),
+                cipher.data_key(),
+                &self.shared.name,
+            )?);
+        }
+        slots.push(crypto::wrap(cipher.data_key(), &key, &self.shared.name)?);
+        self.store_key_slots(&open, &state.slots, slots, None)
+            .await?;
+        Ok(id)
+    }
+
+    /// Makes a new random key that opens this database, and returns it as 64
+    /// hexadecimal characters, once. Store it where you keep secrets.
+    pub async fn add_recovery_key(&self) -> Result<String> {
+        let key = crypto::random_key();
+        self.add_key(*key).await?;
+        Ok(crypto::key_to_hex(&key))
+    }
+
+    /// Stops the key with this id from opening the database. The last key
+    /// cannot be removed.
+    ///
+    /// For a database encrypted before key slots, its first key is also its
+    /// data key: removing that key's slot does not stop it reading values
+    /// already written.
+    pub async fn remove_key(&self, id: &str) -> Result<()> {
+        self.keyed()?;
+        let open = self.open()?;
+        let state = self.key_state(&open).await?;
+        let slots: Vec<KeySlot> = state.slots.iter().filter(|s| s.id != id).cloned().collect();
+        if slots.len() == state.slots.len() {
+            return Err(ValkvEdgeError::NotFound(format!("key {id}")));
+        }
+        if slots.is_empty() {
+            return Err(ValkvEdgeError::Unsupported(
+                "a database keeps at least one key: add another before removing this one".into(),
+            ));
+        }
+        self.store_key_slots(&open, &state.slots, slots, None).await
+    }
+
+    /// The ids of the keys that open this database ([`key_id`]).
+    pub async fn key_ids(&self) -> Result<Vec<String>> {
+        let cipher = self.keyed()?;
+        let open = self.open()?;
+        let state = self.key_state(&open).await?;
+        if state.slots.is_empty() {
+            return Ok(vec![crypto::key_id(cipher.data_key())]);
+        }
+        Ok(state.slots.into_iter().map(|s| s.id).collect())
+    }
+
+    fn keyed(&self) -> Result<Arc<Cipher>> {
+        self.cipher().cloned().ok_or_else(|| {
+            ValkvEdgeError::Unsupported("this database is not open with an encryption key".into())
+        })
+    }
+
+    /// The key slots the database records, for a service that keeps them for
+    /// clients that encrypt their own values. Needs no key: a slot reveals
+    /// nothing without one of the keys. This process must be its writer.
+    pub async fn stored_key_slots(&self) -> Result<Vec<KeySlot>> {
+        let open = self.open()?;
+        let session = self.session_within_limit(&open).await?;
+        match session.as_ref() {
+            Session::Writer(writer) => writer.key_slots().await,
+            Session::Local => open.store.key_slots(),
+            _ => Err(ValkvEdgeError::ReadOnly(
+                "only the database's writer keeps its key slots".into(),
+            )),
+        }
+    }
+
+    /// Replaces the key slots the database records if they are still
+    /// `expected`, for a service that keeps them for its clients. Fails with
+    /// `CONDITION_FAILED` if they changed.
+    pub async fn replace_stored_key_slots(
+        &self,
+        expected: &[KeySlot],
+        slots: Vec<KeySlot>,
+    ) -> Result<()> {
+        let open = self.open()?;
+        let session = self.session_within_limit(&open).await?;
+        let changed = || ValkvEdgeError::ConditionFailed {
+            key: KEY_SLOTS_KEY.to_vec(),
+        };
+        match session.as_ref() {
+            Session::Writer(writer) => {
+                if writer.key_slots().await? != expected {
+                    return Err(changed());
+                }
+                writer.set_key_slots(slots).await
+            }
+            _ => Err(ValkvEdgeError::ReadOnly(
+                "only the database's writer keeps its key slots".into(),
+            )),
+        }
     }
 
     /// The database's name.
@@ -1799,13 +2179,18 @@ impl Database {
                 let Some((store, layout)) = self.kv.layout(&self.shared.name) else {
                     return Ok(Session::Local);
                 };
+                // Unset while a keyed open is still finding its data key: it
+                // checks the key itself once it has.
+                let settled = self.shared.cipher.get().is_some();
                 let cipher = self.cipher().map(Arc::as_ref);
                 let session = match self.kv.role() {
                     Some(Role::Replica) => {
                         let (manifest, _) = valkvedge_log::read_manifest(&store, &layout)
                             .await?
                             .ok_or_else(|| ValkvEdgeError::NotFound(self.shared.name.clone()))?;
-                        crypto::reconcile(cipher, manifest.encryption_check.as_deref(), false)?;
+                        if settled {
+                            crypto::reconcile(cipher, manifest.encryption_check.as_deref(), false)?;
+                        }
                         Session::Replica
                     }
                     _ => {
@@ -1821,10 +2206,14 @@ impl Database {
                         )
                         .await?
                         .with_counters(self.kv.commits.clone());
-                        let empty = writer.position().await?.applied_lsn == 0;
-                        let stored = writer.encryption_check().await?;
-                        if let Some(check) = crypto::reconcile(cipher, stored.as_deref(), empty)? {
-                            writer.set_encryption_check(Some(check)).await?;
+                        if settled {
+                            let empty = writer.position().await?.applied_lsn == 0;
+                            let stored = writer.encryption_check().await?;
+                            if let Some(check) =
+                                crypto::reconcile(cipher, stored.as_deref(), empty)?
+                            {
+                                writer.set_encryption_check(Some(check)).await?;
+                            }
                         }
                         Session::Writer(Box::new(writer))
                     }

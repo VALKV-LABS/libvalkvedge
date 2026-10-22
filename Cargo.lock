@@ -2094,6 +2094,7 @@ dependencies = [
  "tracing",
  "valkvedge-log",
  "valkvedge-sync",
+ "zeroize",
 ]
 
 [[package]]

@@ -6,8 +6,8 @@
 
 use crate::error::{Error, Result};
 use crate::format::{
-    decode_snapshot_part, encode_snapshot_part, Layout, Manifest, PartRef, Record, Segment,
-    Superseded,
+    decode_snapshot_part, encode_snapshot_part, KeySlot, Layout, Manifest, PartRef, Record,
+    Segment, Superseded,
 };
 use crate::lease::{acquire, Lease, Node};
 use crate::store::{PutOutcome, Store};
@@ -420,6 +420,14 @@ impl LogWriter {
         self.check_usable()?;
         let mut next = self.manifest.clone();
         next.encryption_check = check;
+        self.write_manifest(next).await
+    }
+
+    /// Replaces the manifest's key slots.
+    pub async fn set_key_slots(&mut self, slots: Vec<KeySlot>) -> Result<()> {
+        self.check_usable()?;
+        let mut next = self.manifest.clone();
+        next.key_slots = slots;
         self.write_manifest(next).await
     }
 

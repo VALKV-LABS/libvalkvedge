@@ -357,6 +357,29 @@ Key names are not encrypted, because ordered scans and conflict resolution need 
 A sealed marker is stored in the manifest and locally. Opening with the wrong key, or
 with no key, fails with `INVALID_ENCRYPTION_KEY` before any value is read.
 
+**Keys and the data key.** Values are sealed with the database's *data key*, not with
+the key the application gives. Each key that may open the database holds a copy of the
+data key sealed with it, a *key slot* (see [format](format.md#manifestjson)); any one of
+them opens the database. The slots live in the manifest, at a hosted service for a
+hosted database, and in the local store, which keeps a copy so a database opens offline
+once a copy has seen its slots.
+
+- **A new encrypted database** gets a random data key and two slots: one for the key it
+  was opened with, one for a new **recovery key**. `Database::take_recovery_key` gives
+  the recovery key out once, as 64 hexadecimal characters. Nothing else has it: if every
+  key is lost, the data cannot be recovered, by anyone.
+- **More keys.** `add_key` gives another key a slot, `add_recovery_key` makes a random
+  one and returns it, `remove_key(id)` removes one, and `key_ids` lists them. The last
+  key cannot be removed. Nothing is encrypted again: history, restores and branches keep
+  working.
+- **A database encrypted before key slots** has none: its one key is its data key, and
+  it opens as before. Adding a key gives that key the first slot. Removing that first
+  key's slot does not stop it reading what was written: it is still the data key.
+- **Changing keys is done by the writer**, or through a hosted service; a replica of an
+  object store cannot.
+- **Key material in memory.** Keys and data keys are held in memory that is wiped when
+  they are dropped. Keys are compared by their ids, never by keeping a copy.
+
 ## Errors
 
 One error type, `valkvedge::ValkvEdgeError`, with a stable `code()` for programs and a

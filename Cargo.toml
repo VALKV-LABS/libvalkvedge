@@ -39,6 +39,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 tracing = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

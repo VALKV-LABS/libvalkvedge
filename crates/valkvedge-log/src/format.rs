@@ -310,6 +310,15 @@ pub struct PartRef {
     pub checksum: u32,
 }
 
+/// One key that may open an encrypted database: the data key, sealed with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeySlot {
+    /// Names the key without revealing it: hex of a tag the key computes.
+    pub id: String,
+    /// The data key sealed with this key: hex of nonce, ciphertext and tag.
+    pub wrapped: String,
+}
+
 /// A generation that has been replaced. It is kept while replicas that are
 /// behind may still read its log, and while it is part of the history that
 /// restores are made from.
@@ -356,6 +365,11 @@ pub struct Manifest {
     /// Hex-encoded sealed marker, present when values are encrypted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_check: Option<String>,
+    /// The key values are encrypted with (the data key), wrapped by each key
+    /// that may open the database. Empty for a database encrypted before key
+    /// slots existed: its one key is its data key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_slots: Vec<KeySlot>,
     /// When the current snapshot was installed, in milliseconds since the
     /// Unix epoch. Absent in older manifests and for generation 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -377,6 +391,7 @@ impl Manifest {
             owner_epoch: 0,
             superseded: Vec::new(),
             encryption_check: None,
+            key_slots: Vec::new(),
             snapshot_ms: None,
             restored: false,
         }
